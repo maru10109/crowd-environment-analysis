@@ -15,6 +15,7 @@
 ## 데이터
 - 출처(주소):스마트서울 도시데이터 센서(S-DoT) 환경정보(https://data.seoul.go.kr/dataList/OA-15969/S/1/datasetView.do), 스마트서울 도시데이터 센서(S-DoT) 유동인구 측정 정보(https://data.seoul.go.kr/dataList/OA-15964/S/1/datasetView.do)
 - 기간·행 수·열 수: 2020.05.06 ~ 현재 / 열 수(API 출력 항목)는 환경정보 58개, 유동인구 8개 / 행 수..?
-- 사용한 열: 환경정보 API: 병합 기준 - SN(시리얼), MSRMT_HR(측정시간) / 종속 변수(예측값) - AVG_TP(온도 평균), AVG_HUM(습도 평균), AVG_NIS(소음 평균)
+- 사용한 열: 
+환경정보 API: 병합 기준 - SN(시리얼), MSRMT_HR(측정시간) / 종속 변수(예측값) - AVG_TP(온도 평균), AVG_HUM(습도 평균), AVG_NIS(소음 평균)
 유동인구 API: 병합 기준 - SERIAL_NO(시리얼), SENSING_TIME(측정시간) / 독립 변수(입력값) - VISITOR_COUNT(방문자수)
 - 개인 단위 정보 없음 확인: 예 (사람의 수를 집계한 수치와 환경 센서 측정값만 제공되며, 개인 식별 정보는 없음.)
