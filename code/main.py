@@ -92,5 +92,15 @@ def prepare_features(df, selected_features, datetime_features):
     # Convert numeric-like strings to numeric when mostly convertible
     for col in X.columns:
         if X[col].dtype == "object":
-            converted = pd.to_numeric(X[col].astype(str).str.replace(",", "", regex=False), errors="coerce")
+            converted = pd.to_numeric(
+                X[col].astype(str).str.replace(",", "", regex=False),
+                errors="coerce"
+            )
             if converted.notna().mean() >= 0.85:
+                X[col] = converted
+            else:
+                X[col] = X[col].astype(str).replace(
+                    {"nan": np.nan, "None": np.nan, "": np.nan}
+                )
+
+    X = X.dropna(axis=1, how="all")
