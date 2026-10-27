@@ -1,6 +1,4 @@
-    y = working[target].copy()
-
-    if X.shape[1] == 0:
+if X.shape[1] == 0:
         st.error("학습에 사용할 수 있는 입력 특징이 없습니다. 다른 특징 열을 선택해 주세요.")
         return
 
