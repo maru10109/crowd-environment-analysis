@@ -1,106 +1,74 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 
-from sklearn.model_selection import train_test_split
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.impute import SimpleImputer
-from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier, ExtraTreesRegressor, ExtraTreesClassifier
-from sklearn.tree import DecisionTreeRegressor, DecisionTreeClassifier
-from sklearn.metrics import (
-    mean_absolute_error, mean_squared_error, r2_score,
-    accuracy_score, precision_score, recall_score, f1_score,
-    confusion_matrix, ConfusionMatrixDisplay
-)
-
+# 페이지 기본 설정
 st.set_page_config(
-    page_title="서울 도시데이터 머신러닝 분석",
-    page_icon="🏙️",
+    page_title="유동인구와 미세 기후 변화 분석",
+    page_icon="🌡️",
     layout="wide"
 )
 
-st.title("🏙️ 서울 도시데이터 머신러닝 분석")
-st.caption("서울 열린데이터광장의 S-DoT 환경정보와 유동인구 자료를 활용한 데이터 분석·머신러닝 실험")
+# -----------------------------------------------------------------------------
+# 1. API 키 설정 (Streamlit Secrets 활용)
+# -----------------------------------------------------------------------------
+# Streamlit Cloud 환경에서는 앱 설정의 'Secrets' 메뉴에 아래 키를 입력해야 합니다.
+# 로컬 환경에서는 프로젝트 폴더 내 .streamlit/secrets.toml 파일에 아래와 같이 저장합니다.
+# [secrets]
+# ENV_API_KEY = "여러분의_환경정보_API_키"
+# POP_API_KEY = "여러분의_유동인구_API_키"
 
-with st.expander("📥 데이터 다운로드 방법", expanded=False):
-    st.markdown(
-        """
-        1. [S-DoT 환경정보](https://data.seoul.go.kr/dataList/OA-15969/S/1/datasetView.do)에 접속합니다.
-        2. 파일 내려받기에서 원하는 기간의 `S-DoT_NATURE_...csv` 파일을 내려받습니다.
-        3. [S-DoT 유동인구 측정 정보](https://data.seoul.go.kr/dataList/OA-15964/S/1/datasetView.do)에 접속합니다.
-        4. `S-DoT_WALK_...csv` 파일을 내려받습니다.
-        5. 아래 각 탭에서 해당 CSV 파일을 업로드합니다.
+def load_api_keys():
+    try:
+        # 시크릿 변수명 명시: 환경정보 API, 유동인구 API
+        env_key = st.secrets["ENV_API_KEY"]
+        pop_key = st.secrets["POP_API_KEY"]
+        return env_key, pop_key
+    except KeyError as e:
+        st.error(f"⚠️ 필수 API 키가 누락되었습니다: {e}")
+        st.info("Streamlit Secrets 설정(.streamlit/secrets.toml)을 확인해 주세요.")
+        st.stop() # 키가 없으면 앱 실행을 중단합니다.
 
-        **팁:** 먼저 1주일 분량 CSV 파일로 시험해 보세요. 연간 ZIP 파일은 압축을 풀고 CSV를 선택해야 합니다.
-        """
-    )
+env_api_key, pop_api_key = load_api_keys()
 
-st.info(
-    "두 자료는 측정 주기와 센서 구성이 다릅니다. 이 앱은 각 데이터셋을 별도로 분석하며, "
-    "위치·시간 키가 실제로 일치한다고 확인되지 않은 데이터를 임의로 합치지 않습니다."
-)
+# -----------------------------------------------------------------------------
+# 2. 메인 화면 구성
+# -----------------------------------------------------------------------------
+st.title("🚶‍♂️ 유동인구 밀집은 정말 미세 기후를 변화시킬까?")
+st.markdown("""
+이 대시보드는 **서울시 유동인구 데이터**와 **S-DoT 환경정보 데이터(온도, 습도, 소음)**를 
+병합하여, 사람들의 밀집도가 국지적인 미세 기후에 미치는 영향을 회귀 분석을 통해 살펴봅니다.
+""")
 
-def read_csv_safely(uploaded_file):
-    """Try common encodings; load CSV and normalize column names."""
-    errors = []
-    for enc in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
-        try:
-            uploaded_file.seek(0)
-            df = pd.read_csv(uploaded_file, encoding=enc, low_memory=False)
-            df.columns = [str(c).strip() for c in df.columns]
-            # Remove completely empty rows/columns
-            df = df.dropna(how="all").dropna(axis=1, how="all")
-            return df
-        except Exception as e:
-            errors.append(f"{enc}: {e}")
-    raise ValueError("CSV를 읽지 못했습니다. 파일이 CSV인지 확인해 주세요.\n" + "\n".join(errors[-2:]))
+st.divider()
 
-def guess_datetime_columns(df):
-    result = []
-    for col in df.columns:
-        name = str(col).lower()
-        if any(word in name for word in ["일시", "시간", "날짜", "측정일", "date", "time", "dtm"]):
-            result.append(col)
-    return result
+# 사이드바 구성
+with st.sidebar:
+    st.header("⚙️ 분석 설정")
+    st.write("API Key 상태: **정상 로드됨 ✅**")
+    st.caption("환경정보 및 유동인구 API 준비 완료")
+    
+    # 향후 구현할 필터링 옵션 예시
+    selected_region = st.selectbox("분석 지역 선택", ["종로구", "강남구", "마포구"])
+    selected_time = st.slider("시간대 필터링", 0, 23, (9, 18))
 
-def parse_datetime_feature(df, col):
-    dt = pd.to_datetime(df[col], errors="coerce")
-    if dt.notna().mean() < 0.5:
-        # Try compact timestamps and strings with separators removed
-        compact = df[col].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
-        for fmt in ("%Y%m%d%H%M%S", "%Y%m%d%H%M", "%Y%m%d", "%Y-%m-%d %H:%M:%S"):
-            trial = pd.to_datetime(compact, format=fmt, errors="coerce")
-            if trial.notna().mean() > dt.notna().mean():
-                dt = trial
-    return dt
+# -----------------------------------------------------------------------------
+# 3. 데이터 로딩 및 분석 (Mock-up)
+# -----------------------------------------------------------------------------
+# 향후 실제 데이터를 병합하고 회귀 분석(Linear Regression) 모델을 적용할 공간입니다.
+st.subheader("📊 데이터 탐색 및 회귀 분석 결과")
+st.info("아직 실제 데이터가 연결되지 않았습니다. 현재는 기본 앱 뼈대만 출력됩니다.")
 
-def prepare_features(df, selected_features, datetime_features):
-    X = df[selected_features].copy()
-    for col in datetime_features:
-        if col not in X.columns:
-            continue
-        dt = parse_datetime_feature(X, col)
-        X[col + "_연도"] = dt.dt.year
-        X[col + "_월"] = dt.dt.month
-        X[col + "_요일"] = dt.dt.dayofweek
-        X[col + "_시각"] = dt.dt.hour
-        X[col + "_분"] = dt.dt.minute
-        X = X.drop(columns=[col])
-    # Convert numeric-like strings to numeric when mostly convertible
-    for col in X.columns:
-        if X[col].dtype == "object":
-            converted = pd.to_numeric(
-                X[col].astype(str).str.replace(",", "", regex=False),
-                errors="coerce"
-            )
-            if converted.notna().mean() >= 0.85:
-                X[col] = converted
-            else:
-                X[col] = X[col].astype(str).replace(
-                    {"nan": np.nan, "None": np.nan, "": np.nan}
-                )
+# 임시 데이터로 구조만 잡아두기
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.metric(label="현재 선택된 지역", value=selected_region)
+with col2:
+    st.metric(label="분석 대상 시간", value=f"{selected_time[0]}시 ~ {selected_time[1]}시")
+with col3:
+    st.metric(label="핵심 분석 변수", value="방문자수 ➡️ 온도, 습도, 소음")
 
-    X = X.dropna(axis=1, how="all")
+# TODO: 회귀 분석 결과 시각화 차트 추가 공간
+st.write("---")
+st.markdown("### 📈 (예정) 방문자수(VISITOR_COUNT) 변화에 따른 미세 기후 추세선")
+st.line_chart(pd.DataFrame(np.random.randn(20, 2), columns=['방문자수(Scaled)', '온도 AVG_TP(Scaled)']))
