@@ -49,21 +49,16 @@ with st.sidebar:
     st.write("API Key 상태: **정상 로드됨 ✅**")
     st.caption("환경정보 및 유동인구 API 준비 완료")
     
-    # 향후 구현할 필터링 옵션 예시
-    selected_region = st.selectbox("분석 지역 선택", ["종로구", "강남구", "마포구"])
-    selected_time = st.slider("시간대 필터링", 0, 23, (9, 18))
-
-    st.divider()
-    st.markdown("**API 서비스명 설정**")
-    st.caption("서울시 열린데이터광장 API 서비스명")
-    env_service = st.text_input("환경정보 서비스명", value="IotVdata018")
-    pop_service = st.text_input("유동인구 서비스명", value="SPOP_LOCAL_RESD_DONG")
+    # 필터링 옵션 (날짜, 지역, 시간)
+    selected_date = st.date_input("날짜 선택", pd.to_datetime("today"))
+    selected_region = st.selectbox("분석 지역 선택", ["은평구", "마포구", "종로구", "강남구", "서초구"])
+    selected_time = st.slider("시간대 필터링 (시)", 0, 23, (9, 18))
 
 # -----------------------------------------------------------------------------
 # 3. 데이터 로딩 (서울시 공공데이터 API 연동)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=3600) # 1시간 동안 데이터를 캐싱하여 불필요한 API 호출 방지
-def fetch_seoul_data(api_key, service_name, start_idx=1, end_idx=100):
+def fetch_seoul_data(api_key, service_name, start_idx=1, end_idx=1000):
     """서울시 열린데이터광장 API에서 JSON 데이터를 가져와 DataFrame으로 반환"""
     url = f"http://openapi.seoul.go.kr:8088/{api_key}/json/{service_name}/{start_idx}/{end_idx}/"
     try:
@@ -83,10 +78,11 @@ def fetch_seoul_data(api_key, service_name, start_idx=1, end_idx=100):
         st.error(f"[{service_name}] API 호출 중 오류 발생: {e}")
         return pd.DataFrame()
 
-# 메인 화면 스피너 표시하며 데이터 로딩
+# 메인 화면 스피너 표시하며 데이터 로딩 (필터링을 위해 1000건 넉넉히 호출)
 with st.spinner("서울시 API에서 실시간 데이터를 불러오는 중입니다..."):
-    df_env = fetch_seoul_data(env_api_key, env_service, 1, 100)
-    df_pop = fetch_seoul_data(pop_api_key, pop_service, 1, 100)
+    # IotVdata017: 환경정보, IotVdata018: 유동인구
+    df_env = fetch_seoul_data(env_api_key, "IotVdata017", 1, 1000)
+    df_pop = fetch_seoul_data(pop_api_key, "IotVdata018", 1, 1000)
 
 # -----------------------------------------------------------------------------
 # 4. 데이터 탐색 및 회귀 분석 결과
@@ -95,49 +91,63 @@ st.subheader("📊 데이터 탐색 및 회귀 분석 결과")
 
 # 데이터가 모두 정상적으로 로드되었는지 확인
 if not df_env.empty and not df_pop.empty:
-    st.success("실제 데이터를 성공적으로 불러왔습니다! 🚀")
+    
+    # 1. 환경 데이터 필터링 (CGG: 자치구, REG_DT: 등록일시)
+    df_env['REG_DT'] = pd.to_datetime(df_env['REG_DT'], errors='coerce')
+    mask_env = (
+        (df_env['CGG'].str.contains(selected_region, na=False)) &
+        (df_env['REG_DT'].dt.date == selected_date) &
+        (df_env['REG_DT'].dt.hour >= selected_time[0]) &
+        (df_env['REG_DT'].dt.hour <= selected_time[1])
+    )
+    df_env_filtered = df_env[mask_env].copy()
+
+    # 2. 유동인구 데이터 필터링 (AUTONOMOUS_DISTRICT: 자치구, REG_DTTM: 등록일시)
+    df_pop['REG_DTTM'] = pd.to_datetime(df_pop['REG_DTTM'], errors='coerce')
+    mask_pop = (
+        (df_pop['AUTONOMOUS_DISTRICT'].str.contains(selected_region, na=False)) &
+        (df_pop['REG_DTTM'].dt.date == selected_date) &
+        (df_pop['REG_DTTM'].dt.hour >= selected_time[0]) &
+        (df_pop['REG_DTTM'].dt.hour <= selected_time[1])
+    )
+    df_pop_filtered = df_pop[mask_pop].copy()
+
+    st.success("실제 데이터를 성공적으로 불러와 필터링을 적용했습니다! 🚀")
     
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric(label="현재 선택된 지역", value=selected_region)
     with col2:
-        st.metric(label="분석 대상 시간", value=f"{selected_time[0]}시 ~ {selected_time[1]}시")
+        st.metric(label="분석 대상 날짜/시간", value=f"{selected_date} ({selected_time[0]}시~{selected_time[1]}시)")
     with col3:
-        st.metric(label="불러온 데이터 건수", value=f"환경 {len(df_env)}건 / 인구 {len(df_pop)}건")
+        st.metric(label="필터링된 데이터 건수", value=f"환경 {len(df_env_filtered)}건 / 인구 {len(df_pop_filtered)}건")
 
-    # 탭을 나누어 원본 데이터 미리보기 제공
+    # 탭을 나누어 필터링된 원본 데이터 미리보기 제공
     tab1, tab2 = st.tabs(["🍃 환경정보 데이터 (S-DoT)", "🚶 유동인구 데이터"])
     with tab1:
-        st.dataframe(df_env.head(20), use_container_width=True)
+        st.dataframe(df_env_filtered, use_container_width=True)
     with tab2:
-        st.dataframe(df_pop.head(20), use_container_width=True)
+        st.dataframe(df_pop_filtered, use_container_width=True)
         
     st.write("---")
-    st.markdown("### 📈 데이터 시각화 및 상관관계 (진행 중)")
-    st.caption("현재는 불러온 원본 데이터를 바탕으로 임시 차트를 렌더링합니다. (추후 병합 및 전처리 필요)")
+    st.markdown("### 📈 환경 데이터 시각화 (온도, 습도, 소음)")
     
-    # 문자열로 들어온 수치형 데이터를 float으로 변환 시도 (차트를 그리기 위함)
-    # 실제 사용하시는 API 규격(컬럼명)에 맞춰 추후 수정이 필요합니다.
-    numeric_env = df_env.copy()
+    if len(df_env_filtered) > 0:
+        # 차트를 위해 문자열을 숫자(float)로 명시적 변환
+        chart_data = df_env_filtered[['REG_DT', 'AVG_TP', 'AVG_HUM', 'AVG_NIS']].copy()
+        chart_data['AVG_TP'] = pd.to_numeric(chart_data['AVG_TP'], errors='coerce')
+        chart_data['AVG_HUM'] = pd.to_numeric(chart_data['AVG_HUM'], errors='coerce')
+        chart_data['AVG_NIS'] = pd.to_numeric(chart_data['AVG_NIS'], errors='coerce')
+        
+        # 시간순 정렬 후 인덱스 설정
+        chart_data = chart_data.sort_values('REG_DT').set_index('REG_DT').dropna()
+        
+        if not chart_data.empty:
+            st.line_chart(chart_data)
+        else:
+            st.info("수치형 데이터로 변환할 수 있는 값이 부족합니다.")
+    else:
+        st.info("선택하신 조건(지역/날짜/시간)에 해당하는 데이터가 없습니다. 필터 조건을 넓혀보세요.")
 
-for col in numeric_env.columns:
-    converted = pd.to_numeric(numeric_env[col], errors="coerce")
-    if converted.notna().any():
-        numeric_env[col] = converted
-
-numeric_env = numeric_env.select_dtypes(include=[np.number])
-    
-   # 문자열로 들어온 수치형 데이터를 숫자로 변환
-numeric_env = df_env.copy()
-
-for col in numeric_env.columns:
-    converted = pd.to_numeric(numeric_env[col], errors="coerce")
-    if converted.notna().any():
-        numeric_env[col] = converted
-
-numeric_env = numeric_env.select_dtypes(include=[np.number])
-
-if not numeric_env.empty:
-    st.line_chart(numeric_env)
 else:
-    st.info("환경 데이터에서 즉시 시각화할 수치형 컬럼을 찾지 못했습니다. 전처리를 추가해주세요.")
+    st.warning("데이터를 불러오지 못했습니다. API 키가 정확한지 확인해 주세요.")
