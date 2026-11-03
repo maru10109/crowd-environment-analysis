@@ -127,11 +127,17 @@ for col in numeric_env.columns:
 
 numeric_env = numeric_env.select_dtypes(include=[np.number])
     
-    if not numeric_env.empty:
-        # 데이터의 편차가 커서 보기 어려울 수 있으므로 일부 컬럼만 선택하거나 정규화가 추후 필요합니다.
-        st.line_chart(numeric_env)
-    else:
-        st.info("환경 데이터에서 즉시 시각화할 수치형 컬럼을 찾지 못했습니다. 전처리를 추가해주세요.")
+   # 문자열로 들어온 수치형 데이터를 숫자로 변환
+numeric_env = df_env.copy()
 
+for col in numeric_env.columns:
+    converted = pd.to_numeric(numeric_env[col], errors="coerce")
+    if converted.notna().any():
+        numeric_env[col] = converted
+
+numeric_env = numeric_env.select_dtypes(include=[np.number])
+
+if not numeric_env.empty:
+    st.line_chart(numeric_env)
 else:
-    st.warning("데이터를 불러오지 못했습니다. 사이드바의 **API 서비스명**이 맞는지 확인해 주세요.")
+    st.info("환경 데이터에서 즉시 시각화할 수치형 컬럼을 찾지 못했습니다. 전처리를 추가해주세요.")
