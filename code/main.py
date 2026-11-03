@@ -118,7 +118,14 @@ if not df_env.empty and not df_pop.empty:
     
     # 문자열로 들어온 수치형 데이터를 float으로 변환 시도 (차트를 그리기 위함)
     # 실제 사용하시는 API 규격(컬럼명)에 맞춰 추후 수정이 필요합니다.
-    numeric_env = df_env.apply(pd.to_numeric, errors='ignore').select_dtypes(include=[np.number])
+    numeric_env = df_env.copy()
+
+for col in numeric_env.columns:
+    converted = pd.to_numeric(numeric_env[col], errors="coerce")
+    if converted.notna().any():
+        numeric_env[col] = converted
+
+numeric_env = numeric_env.select_dtypes(include=[np.number])
     
     if not numeric_env.empty:
         # 데이터의 편차가 커서 보기 어려울 수 있으므로 일부 컬럼만 선택하거나 정규화가 추후 필요합니다.
