@@ -60,42 +60,55 @@ def show(df, n=1000):
     st.dataframe(df.head(n), use_container_width=True, hide_index=True)
 
 
-# ---------------- API ----------------
+# ---------------- API (페이지 단위 병렬) ----------------
+_session = requests.Session()
+
+
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_day(key, service, gu, day, max_pages):
-    rows, start = [], 1
-    for _ in range(max_pages):
-        end = start + PAGE - 1
-        url = f"http://openapi.seoul.go.kr:8088/{key}/json/{service}/{start}/{end}/"
-        if gu and day:
-            url += f"{gu}/{day}"
-        try:
-            j = requests.get(url, timeout=30).json()
-        except Exception:
-            raise RuntimeError(f"{service} 호출 실패(네트워크 또는 응답 형식 오류)")
-        if service not in j:
-            res = j.get("RESULT", {})
-            if res.get("CODE") == "INFO-200":
-                break
-            raise RuntimeError(f"{service}: {res.get('MESSAGE', '알 수 없는 오류')}")
-        block = j[service]
-        rows += block.get("row", [])
-        if end >= int(block.get("list_total_count", 0)):
-            break
-        start = end + 1
+def fetch_page(key, service, gu, day, start, end):
+    """한 페이지(최대 1000건). (총 건수, 행 목록)을 반환. 조건에 맞는 데이터가 없으면 (0, [])."""
+    url = f"http://openapi.seoul.go.kr:8088/{key}/json/{service}/{start}/{end}/"
+    if gu and day:
+        url += f"{gu}/{day}"
+    try:
+        j = _session.get(url, timeout=20).json()
+    except Exception:
+        raise RuntimeError(f"{service} 호출 실패(네트워크 또는 응답 형식 오류)")  # 키 노출 방지
+    if service not in j:
+        res = j.get("RESULT", {})
+        if res.get("CODE") == "INFO-200":
+            return 0, []
+        raise RuntimeError(f"{service}: {res.get('MESSAGE', '알 수 없는 오류')}")
+    block = j[service]
+    return int(block.get("list_total_count", 0)), block.get("row", [])
+
+
+def fetch_all(key, service, gu, days, max_pages, progress=None):
+    """모든 날짜의 1페이지를 병렬로 받고, 남은 페이지도 병렬로 받아 합친다."""
+    rows = []
+    # 1단계: 날짜별 첫 페이지
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        firsts = list(ex.map(lambda d: (d, fetch_safe(key, service, gu, d, 1, PAGE)), days))
+    todo = []
+    for d, (total, r) in firsts:
+        rows += r
+        last = min((total + PAGE - 1) // PAGE, max_pages)
+        for pg in range(2, last + 1):
+            todo.append((d, (pg - 1) * PAGE + 1, pg * PAGE))
+    # 2단계: 나머지 페이지 전부 동시에
+    if todo:
+        with ThreadPoolExecutor(max_workers=12) as ex:
+            futs = [ex.submit(fetch_safe, key, service, gu, d, s, e) for d, s, e in todo]
+            for f in futs:
+                rows += f.result()[1]
     return pd.DataFrame(rows)
 
 
-def fetch_range(key, service, gu, days, max_pages):
-    def one(d):
-        try:
-            return fetch_day(key, service, gu, d, max_pages)
-        except RuntimeError:
-            return pd.DataFrame()
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        parts = [p for p in ex.map(one, days) if not p.empty]
-    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
-
+def fetch_safe(key, service, gu, day, start, end):
+    try:
+        return fetch_page(key, service, gu, day, start, end)
+    except RuntimeError:
+        return 0, []
 
 @st.cache_data(show_spinner=False)
 def load_map():
@@ -251,16 +264,23 @@ if btn:
         st.stop()
     gu, notice = DISTRICTS[ko_gu], ""
     try:
-        with st.spinner(f"API 호출 중 ({len(days)}일)..."):
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                f_env = ex.submit(fetch_range, ENV_KEY, ENV_SERVICE, gu, days, 5)
-                f_pop = ex.submit(fetch_range, POP_KEY, POP_SERVICE, gu, days, 5)
-                env_raw, pop_raw = f_env.result(), f_pop.result()
-            if pop_raw.empty:
-                latest = fetch_day(POP_KEY, POP_SERVICE, None, None, 6)
+        bar = st.progress(0, text="환경정보 불러오는 중...")
+        env_raw = fetch_all(ENV_KEY, ENV_SERVICE, gu, days, 5)
+        bar.progress(50, text="유동인구 불러오는 중...")
+        pop_raw = fetch_all(POP_KEY, POP_SERVICE, gu, days, 5)
+        if pop_raw.empty:
+            bar.progress(80, text="유동인구 서버 필터가 안 되어 최신 데이터에서 고르는 중...")
+            _, first = fetch_page(POP_KEY, POP_SERVICE, None, None, 1, PAGE)
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                futs = [ex.submit(fetch_safe, POP_KEY, POP_SERVICE, None, None,
+                                  (i - 1) * PAGE + 1, i * PAGE) for i in range(1, 7)]
+                latest = pd.DataFrame([r for f in futs for r in f.result()[1]])
+            if not latest.empty:
                 pop_raw = latest[(latest["AUTONOMOUS_DISTRICT"] == gu) &
                                  (latest["SENSING_TIME"].str[:10].isin(days))]
-                notice = "유동인구는 서버 필터가 적용되지 않아 최신 데이터에서 골랐습니다."
+            notice = "유동인구는 서버 필터가 적용되지 않아 최신 데이터에서 골랐습니다."
+        bar.progress(100, text="완료")
+        bar.empty()
         st.session_state.update(env_raw=env_raw, pop_raw=pop_raw, notice=notice,
                                 cond=(ko_gu, days[0], days[-1], len(days)))
     except Exception as e:
