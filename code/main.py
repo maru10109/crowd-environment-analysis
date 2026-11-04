@@ -331,7 +331,7 @@ if mp is not None:
                   "대응표로 이어진 유동인구 센서": len(pop_ids) - len(unmatched),
                   "이어지지 않은 유동인구 센서": len(unmatched)}
 else:
-    st.info("병합 방식: 자치구 + 행정동 + 1시간 단위)")
+    st.info("병합 방식: 자치구 + 행정동 + 1시간 단위")
     pa = pop.groupby(["CGG", "DONG", "HOUR"], as_index=False)["VISITOR_MEAN"].mean()
     ea = env.groupby(["CGG", "DONG", "HOUR"], as_index=False)[list(METRICS)].mean()
     merged = pd.merge(pa, ea, on=["CGG", "DONG", "HOUR"], how="inner")
