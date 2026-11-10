@@ -64,6 +64,12 @@ def show(df, n=1000):
         st.caption(f"전체 {len(df):,}행 중 앞 {n:,}행만 표시합니다.")
     st.dataframe(df.head(n), use_container_width=True, hide_index=True)
 
+def safe_table(df):
+    d = df.copy()
+    for c in d.columns:
+        if d[c].dtype == object:
+            d[c] = d[c].astype(str)
+    st.dataframe(d, use_container_width=True, hide_index=True)
 
 # ---------------- API (페이지 단위 병렬) ----------------
 _session = requests.Session()
