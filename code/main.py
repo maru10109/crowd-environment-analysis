@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import os
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -12,6 +11,7 @@ from sklearn.tree import DecisionTreeRegressor
 from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit
+
 
 st.set_page_config(page_title="인파기상청", page_icon="🌡️", layout="wide")
 
@@ -25,7 +25,9 @@ except KeyError as e:
 
 ENV_SERVICE, POP_SERVICE, PAGE = "IotVdata017", "IotVdata018", 1000
 MAX_DAYS = 14
-MAP_PATH = "data/sensor_map.csv"
+MIN_COVER = 5.0   # 값이 있는 비율(%)이 이보다 낮은 열은 분석에서 제외
+
+ALWAYS = ["AVG_TP", "AVG_HUM"]   # 값이 적어도 항상 분석에 포함 (온도, 습도)
 
 DISTRICTS = {
     "강남구": "Gangnam-gu", "강동구": "Gangdong-gu", "강북구": "Gangbuk-gu",
@@ -38,25 +40,28 @@ DISTRICTS = {
     "은평구": "Eunpyeong-gu", "종로구": "Jongno-gu", "중구": "Jung-gu",
     "중랑구": "Jungnang-gu",
 }
+
+# 후보 환경 열 (소음은 선생님 의견에 따라 제외)
+CANDS = {
+    "AVG_TP": "온도(℃)", "AVG_HUM": "습도(%)", "AVG_WSPD": "풍속(m/s)",
+    "AVG_INILLU": "조도(lux)", "AVG_UV": "자외선(UV)",
+    "AVG_VIBR_XCRD": "진동 x(g)", "AVG_VIBR_YCRD": "진동 y(g)", "AVG_VIBR_ZCRD": "진동 z(g)",
+    "AVG_GT": "흑구온도(℃)", "AVG_NTDX": "이산화질소(ppm)", "AVG_CBMX": "일산화탄소(ppm)",
+    "AVG_SO": "이산화황(ppm)", "AVG_NH3": "암모니아(ppm)", "AVG_H2S": "황화수소(ppm)",
+    "AVG_OZON": "오존(ppm)",
+}
 KO = {
     "MDL_NO": "모델번호", "SN": "시리얼(환경)", "MSRMT_HR": "측정시간", "RGN": "지역유형",
-    "CGG": "자치구", "DONG": "행정동", "AVG_TP": "온도 평균(℃)", "AVG_HUM": "습도 평균(%)",
-    "AVG_NIS": "소음 평균(dB)", "MODEL_NM": "모델명", "SERIAL_NO": "시리얼(유동인구)",
+    "CGG": "자치구", "DONG": "행정동", "MODEL_NM": "모델명", "SERIAL_NO": "시리얼(유동인구)",
     "SENSING_TIME": "측정시간", "REGION": "지역유형", "AUTONOMOUS_DISTRICT": "자치구",
     "ADMINISTRATIVE_DISTRICT": "행정동", "VISITOR_COUNT": "방문자 수(명)",
     "REG_DTTM": "등록일시", "REG_DT": "등록일시", "HOUR": "시간(1시간 단위)",
-    "VISITOR_MEAN": "평균 방문자 수(명)", "N_READ": "측정 횟수",
+    "VISITOR_MEAN": "평균 방문자 수(명)", **CANDS,
 }
-ENV_COLS = ["SN", "MSRMT_HR", "RGN", "CGG", "DONG", "AVG_TP", "AVG_HUM", "AVG_NIS"]
-METRICS = {"AVG_TP": "온도(℃)", "AVG_HUM": "습도(%)", "AVG_NIS": "소음(dB)"}
 
 
 def ko(df):
     return df.rename(columns=KO)
-
-
-def norm_id(s):
-    return s.astype(str).str.strip().str.lstrip("0").str.upper()
 
 
 def show(df, n=1000):
@@ -71,13 +76,13 @@ def safe_table(df):
             d[c] = d[c].astype(str)
     st.dataframe(d, use_container_width=True, hide_index=True)
 
+
 # ---------------- API (페이지 단위 병렬) ----------------
 _session = requests.Session()
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_page(key, service, gu, day, start, end):
-    """한 페이지(최대 1000건). (총 건수, 행 목록)을 반환. 조건에 맞는 데이터가 없으면 (0, [])."""
     url = f"http://openapi.seoul.go.kr:8088/{key}/json/{service}/{start}/{end}/"
     if gu and day:
         url += f"{gu}/{day}"
@@ -94,10 +99,15 @@ def fetch_page(key, service, gu, day, start, end):
     return int(block.get("list_total_count", 0)), block.get("row", [])
 
 
-def fetch_all(key, service, gu, days, max_pages, progress=None):
-    """모든 날짜의 1페이지를 병렬로 받고, 남은 페이지도 병렬로 받아 합친다."""
+def fetch_safe(key, service, gu, day, start, end):
+    try:
+        return fetch_page(key, service, gu, day, start, end)
+    except RuntimeError:
+        return 0, []
+
+
+def fetch_all(key, service, gu, days, max_pages):
     rows = []
-    # 1단계: 날짜별 첫 페이지
     with ThreadPoolExecutor(max_workers=12) as ex:
         firsts = list(ex.map(lambda d: (d, fetch_safe(key, service, gu, d, 1, PAGE)), days))
     todo = []
@@ -106,7 +116,6 @@ def fetch_all(key, service, gu, days, max_pages, progress=None):
         last = min((total + PAGE - 1) // PAGE, max_pages)
         for pg in range(2, last + 1):
             todo.append((d, (pg - 1) * PAGE + 1, pg * PAGE))
-    # 2단계: 나머지 페이지 전부 동시에
     if todo:
         with ThreadPoolExecutor(max_workers=12) as ex:
             futs = [ex.submit(fetch_safe, key, service, gu, d, s, e) for d, s, e in todo]
@@ -115,34 +124,19 @@ def fetch_all(key, service, gu, days, max_pages, progress=None):
     return pd.DataFrame(rows)
 
 
-def fetch_safe(key, service, gu, day, start, end):
-    try:
-        return fetch_page(key, service, gu, day, start, end)
-    except RuntimeError:
-        return 0, []
-
-@st.cache_data(show_spinner=False)
-def load_map():
-    if not os.path.exists(MAP_PATH):
-        return None
-    for enc in ("utf-8-sig", "cp949"):
-        try:
-            return pd.read_csv(MAP_PATH, dtype=str, encoding=enc)
-        except UnicodeDecodeError:
-            continue
-    return None
-
-
 # ---------------- 전처리: 환경정보 ----------------
 @st.cache_data(show_spinner="환경정보 전처리 중...")
-def clean_env(raw, hum100_missing, nis35_missing):
+def clean_env(raw, hum100_missing):
     steps, n_raw = [], len(raw)
 
     def add(stage, col, rule, action, n_val, n_sn):
         steps.append({"단계": stage, "대상": col, "기준": rule, "처리": action,
-                      "해당 값 수": int(n_val), "관련 센서 수": n_sn})
+                      "해당 값 수": int(n_val), "관련 센서 수": str(n_sn)})
 
     df = raw.replace("", np.nan).copy()
+    for c in CANDS:
+        if c not in df.columns:
+            df[c] = np.nan
 
     df["time"] = pd.to_datetime(df["MSRMT_HR"].astype(str).str.replace("_", " "), errors="coerce")
     bad_t = df["time"].isna()
@@ -154,59 +148,64 @@ def clean_env(raw, hum100_missing, nis35_missing):
     df = df[~dup].copy()
     n_after_dup = len(df)
 
-    for c in METRICS:
+    for c in CANDS:
         before = df[c].notna().sum()
         df[c] = pd.to_numeric(df[c], errors="coerce")
-        add("3. 형식", METRICS[c], "숫자로 변환 불가", "빈 값 처리", before - df[c].notna().sum(), "-")
+        n = before - df[c].notna().sum()
+        if n:
+            add("3. 형식", CANDS[c], "숫자로 변환 불가", "빈 값 처리", n, "-")
 
-    miss0 = {c: int(df[c].isna().sum()) for c in METRICS}
-    for c in METRICS:
-        add("4. 결측", METRICS[c], "센서가 값을 주지 않음(빈 값)", "채우지 않고 그대로 둠(없는 값을 만들지 않음)",
-            miss0[c], df.loc[df[c].isna(), "SN"].nunique())
+    # 4) 열별 값 보유 비율 -> 분석 가능한 열 선택
+    cover = {c: df[c].notna().mean() * 100 for c in CANDS}
+    metrics = [c for c in CANDS if c in ALWAYS or cover[c] >= MIN_COVER]
+    for c in CANDS:
+        used = ("분석에 사용(고정)" if c in ALWAYS else "분석에 사용") if c in metrics else f"값이 {MIN_COVER:.0f}% 미만이라 제외"
+        add("4. 결측", CANDS[c], f"값이 있는 비율 {cover[c]:.1f}%", used, df[c].isna().sum(), df.loc[df[c].isna(), "SN"].nunique())
+    miss0 = {c: int(df[c].isna().sum()) for c in metrics}
 
-    bad = (df["AVG_TP"] == -40) | (df["AVG_TP"] < -30) | (df["AVG_TP"] > 50)
-    add("5. 이상치(범위)", "온도", "-40℃(센서 오류 기본값) 또는 -30℃ 미만·50℃ 초과", "빈 값 처리",
-        bad.sum(), df.loc[bad, "SN"].nunique())
-    df.loc[bad, "AVG_TP"] = np.nan
+    # 5) 범위 이상치
+    if "AVG_TP" in metrics:
+        bad = (df["AVG_TP"] == -40) | (df["AVG_TP"] < -30) | (df["AVG_TP"] > 50)
+        add("5. 이상치(범위)", "온도", "-40℃(센서 오류 기본값) 또는 -30℃ 미만·50℃ 초과", "빈 값 처리", bad.sum(), df.loc[bad, "SN"].nunique())
+        df.loc[bad, "AVG_TP"] = np.nan
+    if "AVG_HUM" in metrics:
+        bad = (df["AVG_HUM"] < 0) | (df["AVG_HUM"] > 100)
+        add("5. 이상치(범위)", "습도", "0% 미만 또는 100% 초과", "빈 값 처리", bad.sum(), df.loc[bad, "SN"].nunique())
+        df.loc[bad, "AVG_HUM"] = np.nan
+    for c in metrics:
+        if c in ("AVG_TP", "AVG_HUM", "AVG_GT"):
+            continue
+        bad = df[c] < 0
+        add("5. 이상치(범위)", CANDS[c], "음수(물리적으로 불가능)", "빈 값 처리", bad.sum(), df.loc[bad, "SN"].nunique())
+        df.loc[bad, c] = np.nan
 
-    bad = (df["AVG_HUM"] < 0) | (df["AVG_HUM"] > 100)
-    add("5. 이상치(범위)", "습도", "0% 미만 또는 100% 초과", "빈 값 처리", bad.sum(), df.loc[bad, "SN"].nunique())
-    df.loc[bad, "AVG_HUM"] = np.nan
+    # 6) 의심 값
+    if "AVG_HUM" in metrics:
+        m = df["AVG_HUM"] == 100
+        add("6. 의심 값", "습도", "정확히 100%", "결측 처리" if hum100_missing else "유지(분석에 사용)", m.sum(), df.loc[m, "SN"].nunique())
+        if hum100_missing:
+            df.loc[m, "AVG_HUM"] = np.nan
 
-    bad = df["AVG_NIS"] <= 0
-    add("5. 이상치(범위)", "소음", "0dB 이하", "빈 값 처리", bad.sum(), df.loc[bad, "SN"].nunique())
-    df.loc[bad, "AVG_NIS"] = np.nan
+    # 7) 온도 튀는 값
+    if "AVG_TP" in metrics:
+        df = df.sort_values(["SN", "time"])
+        med = (df.groupby("SN")["AVG_TP"].rolling(5, center=True, min_periods=3).median()
+                 .reset_index(level=0, drop=True).reindex(df.index))
+        sp = (df["AVG_TP"] - med).abs() > 5
+        add("7. 이상치(튐)", "온도", "같은 센서 앞뒤 5개 중앙값과 5℃ 초과 차이", "빈 값 처리", sp.sum(), df.loc[sp, "SN"].nunique())
+        df.loc[sp, "AVG_TP"] = np.nan
 
-    m = df["AVG_HUM"] == 100
-    add("6. 의심 값", "습도", "정확히 100%", "결측 처리" if hum100_missing else "유지(분석에 사용)",
-        m.sum(), df.loc[m, "SN"].nunique())
-    if hum100_missing:
-        df.loc[m, "AVG_HUM"] = np.nan
-    m = df["AVG_NIS"] == 35
-    add("6. 의심 값", "소음", "정확히 35dB(센서 측정 하한일 가능성)", "결측 처리" if nis35_missing else "유지(분석에 사용)",
-        m.sum(), df.loc[m, "SN"].nunique())
-    if nis35_missing:
-        df.loc[m, "AVG_NIS"] = np.nan
+    miss1 = {c: int(df[c].isna().sum()) for c in metrics}
 
-    df = df.sort_values(["SN", "time"])
-    med = (df.groupby("SN")["AVG_TP"]
-             .rolling(5, center=True, min_periods=3).median()
-             .reset_index(level=0, drop=True).reindex(df.index))
-    sp = (df["AVG_TP"] - med).abs() > 5
-    add("7. 이상치(튐)", "온도", "같은 센서 앞뒤 5개 중앙값과 5℃ 초과 차이", "빈 값 처리", sp.sum(), df.loc[sp, "SN"].nunique())
-    df.loc[sp, "AVG_TP"] = np.nan
-
-    miss1 = {c: int(df[c].isna().sum()) for c in METRICS}
-
+    # 8) 센서별 1시간 평균
     df["HOUR"] = df["time"].dt.floor("h")
-    g = df.groupby(["SN", "CGG", "DONG", "HOUR"], as_index=False)
-    agg = g[list(METRICS)].mean()
-    agg["N_READ"] = g.size()["size"].values
+    agg = df.groupby(["SN", "CGG", "DONG", "HOUR"], as_index=False)[metrics].mean()
     add("8. 집계", "전체", "센서별 1시간 평균(두 데이터의 측정 분이 다름)", f"{len(df):,}행 → {len(agg):,}행", len(df), df["SN"].nunique())
 
-    sensors = (df.groupby("SN")[list(METRICS)].apply(lambda x: x.notna().mean() * 100)
-                 .round(1).rename(columns=METRICS).reset_index().rename(columns={"SN": "센서(환경)"}))
-    stat = {"n_raw": n_raw, "n_dedup": n_after_dup, "n_agg": len(agg), "miss0": miss0, "miss1": miss1}
+    sensors = (df.groupby("SN")[metrics].apply(lambda x: x.notna().mean() * 100).round(1)
+                 .rename(columns=CANDS).reset_index().rename(columns={"SN": "센서(환경)"}))
+    stat = {"n_raw": n_raw, "n_dedup": n_after_dup, "n_agg": len(agg),
+            "miss0": miss0, "miss1": miss1, "metrics": metrics, "cover": cover}
     return agg, pd.DataFrame(steps), sensors, stat
 
 
@@ -227,6 +226,7 @@ def clean_pop(raw):
     neg = df["VISITOR_COUNT"] < 0
     steps.append(("방문자 수 음수", "빈 값 처리", int(neg.sum())))
     df.loc[neg, "VISITOR_COUNT"] = np.nan
+    steps.append(("방문자 수 0명", "실제 값이라 유지(비율 확인용)", int((df["VISITOR_COUNT"] == 0).sum())))
     q999 = df["VISITOR_COUNT"].quantile(0.999)
     hi = df["VISITOR_COUNT"] > q999
     steps.append((f"방문자 수 상위 0.1%(>{q999:.0f}명)", "실제 인파일 수 있어 유지(확인만)", int(hi.sum())))
@@ -248,7 +248,7 @@ def overview(df):
 
 # ---------------- 사이드바 ----------------
 st.title("🚶 인파기상청")
-st.caption("유동인구가 밀집하면 그 지역의 온도·습도·소음은 정말 변하는가")
+st.caption("유동인구가 밀집하면 그 지역의 환경 수치는 정말 변하는가")
 
 with st.sidebar:
     st.header("⚙️ 조회 조건")
@@ -261,9 +261,7 @@ with st.sidebar:
     btn = st.button("📥 API에서 데이터 불러오기", type="primary")
     st.header("🧹 의심 값 처리(팀 결정)")
     hum100_missing = st.checkbox("습도 100%를 결측으로 처리", value=False)
-    nis35_missing = st.checkbox("소음 35dB를 결측으로 처리", value=False)
-    st.caption("체크를 바꿔 결과가 얼마나 달라지는지 비교하고 log에 기록하세요. "
-               "온도 -40℃는 항상 결측 처리합니다.")
+    st.caption("체크를 바꿔 결과 차이를 비교하고 log에 기록하세요. 온도 -40℃는 항상 결측 처리합니다.")
 
 if btn:
     if not (isinstance(rng, (tuple, list)) and len(rng) == 2):
@@ -281,7 +279,6 @@ if btn:
         pop_raw = fetch_all(POP_KEY, POP_SERVICE, gu, days, 5)
         if pop_raw.empty:
             bar.progress(80, text="유동인구 서버 필터가 안 되어 최신 데이터에서 고르는 중...")
-            _, first = fetch_page(POP_KEY, POP_SERVICE, None, None, 1, PAGE)
             with ThreadPoolExecutor(max_workers=6) as ex:
                 futs = [ex.submit(fetch_safe, POP_KEY, POP_SERVICE, None, None,
                                   (i - 1) * PAGE + 1, i * PAGE) for i in range(1, 7)]
@@ -310,45 +307,15 @@ if env_raw.empty or pop_raw.empty:
     st.error("한쪽 데이터가 비어 있습니다. 다른 날짜나 자치구를 골라보세요.")
     st.stop()
 
-env, env_log, env_sensor, es = clean_env(env_raw, hum100_missing, nis35_missing)
+env, env_log, env_sensor, es = clean_env(env_raw, hum100_missing)
 pop, pop_log = clean_pop(pop_raw)
+METRICS = {c: CANDS[c] for c in es["metrics"]}
 
-# ---------------- 병합 ----------------
-mp = load_map()
-merge_info, unmatched = {}, []
-if mp is not None:
-    env_ids, pop_ids = set(norm_id(env["SN"])), set(norm_id(pop["SERIAL_NO"]))
-
-    def best(ids):
-        sc = {c: len(ids & set(norm_id(mp[c].dropna()))) for c in mp.columns}
-        return max(sc, key=sc.get)
-
-    with st.sidebar:
-        with st.expander("🔗 센서코드 대응표 열 선택", expanded=False):
-            c_env = st.selectbox("환경정보 시리얼에 해당하는 열", mp.columns, index=list(mp.columns).index(best(env_ids)))
-            c_pop = st.selectbox("유동인구 시리얼에 해당하는 열", mp.columns, index=list(mp.columns).index(best(pop_ids)))
-    cmap = mp[[c_env, c_pop]].dropna().drop_duplicates()
-    cmap.columns = ["ENV_ID", "POP_ID"]
-    cmap["ENV_ID"], cmap["POP_ID"] = norm_id(cmap["ENV_ID"]), norm_id(cmap["POP_ID"])
-    e2, p2 = env.assign(KEY=norm_id(env["SN"])), pop.assign(POP_ID=norm_id(pop["SERIAL_NO"]))
-    p2 = p2.merge(cmap, on="POP_ID", how="left")
-    unmatched = sorted(set(p2.loc[p2["ENV_ID"].isna(), "SERIAL_NO"]))
-    p2 = p2.dropna(subset=["ENV_ID"]).rename(columns={"ENV_ID": "KEY"})
-    merged = pd.merge(p2[["KEY", "SERIAL_NO", "HOUR", "VISITOR_MEAN"]],
-                      e2[["KEY", "SN", "CGG", "DONG", "HOUR", *METRICS]], on=["KEY", "HOUR"], how="inner")
-    merged = merged.drop(columns="KEY")
-    how_merge = "센서코드 대응표로 센서끼리 연결 + 1시간 단위 시간"
-    merge_info = {"환경정보 센서 수": len(env_ids), "유동인구 센서 수": len(pop_ids),
-                  "대응표로 이어진 유동인구 센서": len(pop_ids) - len(unmatched),
-                  "이어지지 않은 유동인구 센서": len(unmatched)}
-else:
-    st.info("병합 방식: 자치구 + 행정동 + 1시간 단위")
-    pa = pop.groupby(["CGG", "DONG", "HOUR"], as_index=False)["VISITOR_MEAN"].mean()
-    ea = env.groupby(["CGG", "DONG", "HOUR"], as_index=False)[list(METRICS)].mean()
-    merged = pd.merge(pa, ea, on=["CGG", "DONG", "HOUR"], how="inner")
-    how_merge = "행정동 + 1시간 단위 시간(대체 방식)"
-
-final = merged.dropna(subset=["VISITOR_MEAN", *METRICS])
+# ---------------- 병합 (자치구 + 행정동 + 1시간) ----------------
+pa = pop.groupby(["CGG", "DONG", "HOUR"], as_index=False)["VISITOR_MEAN"].mean()
+ea = env.groupby(["CGG", "DONG", "HOUR"], as_index=False)[list(METRICS)].mean()
+merged = pd.merge(pa, ea, on=["CGG", "DONG", "HOUR"], how="inner")
+final = merged.dropna(subset=["VISITOR_MEAN"])
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("조회 조건", gu_name)
@@ -359,56 +326,76 @@ c4.metric("유동인구 원본", f"{len(pop_raw):,}행")
 tab_ov, tab_clean, tab_merge, tab_graph, tab_model, tab_raw = st.tabs(
     ["📋 데이터 개요", "🧹 결측치·이상치 처리", "🔗 병합 기록", "📈 그래프와 발견",
      "🤖 모델 비교", "🗂 데이터 보기"])
-
 with tab_ov:
     st.subheader("환경정보 (IotVdata017)")
     st.write(f"**{len(env_raw):,}행 × {env_raw.shape[1]}열**")
-    st.dataframe(overview(env_raw), use_container_width=True, hide_index=True)
+    safe_table(overview(env_raw))
     st.subheader("유동인구 (IotVdata018)")
     st.write(f"**{len(pop_raw):,}행 × {pop_raw.shape[1]}열**")
-    st.dataframe(overview(pop_raw), use_container_width=True, hide_index=True)
+    safe_table(overview(pop_raw))
     st.caption("API가 빈 값을 빈 문자열로 주므로 빈 값으로 바꿔 센 결과입니다. 자료형은 API 원본 그대로(object=문자열)입니다.")
 
 with tab_clean:
+    st.subheader("분석에 쓸 환경 열 선택 결과")
+    safe_table(pd.DataFrame({
+        "열": [CANDS[c] for c in CANDS],
+        "값이 있는 비율(%)": [round(es["cover"][c], 1) for c in CANDS],
+        "사용 여부": ["사용" if c in METRICS else "제외(값 부족)" for c in CANDS]}))
+    st.caption(f"값이 있는 비율이 {MIN_COVER:.0f}% 미만인 열은 분석에서 뺍니다. 소음은 방문자 수가 소음을 올리는 방향의 관계라 "
+               "(선생님 의견) 환경 변화 지표에서 제외했습니다.")
     st.subheader("환경정보 처리 단계")
-    st.dataframe(env_log, use_container_width=True, hide_index=True)
+    safe_table(env_log)
     st.subheader("분석 열별 빈 값 변화 (센서별 10분 단위 행 기준)")
-    st.dataframe(pd.DataFrame({
+    safe_table(pd.DataFrame({
         "열": list(METRICS.values()),
         "처리 전 빈 값": [es["miss0"][c] for c in METRICS],
         "처리 후 빈 값": [es["miss1"][c] for c in METRICS],
         "새로 빈 값이 된 수(이상치)": [es["miss1"][c] - es["miss0"][c] for c in METRICS],
-        "처리 후 빈 값 비율(%)": [round(es["miss1"][c] / max(es["n_dedup"], 1) * 100, 1) for c in METRICS]}),
-        use_container_width=True, hide_index=True)
+        "처리 후 빈 값 비율(%)": [round(es["miss1"][c] / max(es["n_dedup"], 1) * 100, 1) for c in METRICS]}))
     st.subheader("센서별 값이 있는 비율(%)")
-    st.dataframe(env_sensor, use_container_width=True, hide_index=True)
-    st.caption("소음 비율이 0%인 센서는 소음 센서가 달리지 않은 것입니다. 그 센서는 소음 분석에서 자동으로 빠집니다.")
+    safe_table(env_sensor.head(60))
     st.subheader("유동인구 처리 단계")
-    st.dataframe(pop_log, use_container_width=True, hide_index=True)
+    safe_table(pop_log)
     st.subheader("처리 전후 행 수")
-    st.dataframe(pd.DataFrame({
+    safe_table(pd.DataFrame({
         "단계": ["환경정보 원본", "중복·시간오류 제거 후", "센서별 1시간 집계 후",
                 "유동인구 원본", "유동인구 센서별 1시간 집계 후",
-                "병합 후", "분석에 쓰는 행(방문자·온도·습도·소음 모두 있음)"],
-        "행 수": [es["n_raw"], es["n_dedup"], es["n_agg"], len(pop_raw), len(pop), len(merged), len(final)]}),
-        use_container_width=True, hide_index=True)
+                "병합 후(행정동×시간)", "분석에 쓰는 행(방문자 수 있음)"],
+        "행 수": [es["n_raw"], es["n_dedup"], es["n_agg"], len(pop_raw), len(pop), len(merged), len(final)]}))
 
 with tab_merge:
-    st.write(f"**병합 방식:** {how_merge}")
-    if merge_info:
-        st.dataframe(pd.DataFrame(merge_info.items(), columns=["항목", "개수"]), use_container_width=True, hide_index=True)
-        if unmatched:
-            st.write("대응표로 이어지지 않아 분석에서 빠진 유동인구 센서:", ", ".join(unmatched))
-    st.write(f"병합 전: 환경 {len(env):,}행 · 유동인구 {len(pop):,}행 → 병합 후 {len(merged):,}행 → 분석 행 {len(final):,}행")
+    st.write("**병합 방식:** 자치구 + 행정동 + 1시간 단위 (두 API의 센서 번호 체계가 달라 센서 대응표 없이 병합)")
+    st.write(f"병합 전: 환경 {len(env):,}행 · 유동인구 {len(pop):,}행 → 행정동 단위 집계: 환경 {len(ea):,}행 · 유동인구 {len(pa):,}행 "
+             f"→ 병합 후 {len(merged):,}행")
+    st.write(f"환경 센서 {env['SN'].nunique()}개 · 유동인구 센서 {pop['SERIAL_NO'].nunique()}개 · "
+             f"행정동 {merged['DONG'].nunique()}개")
+    per_dong = pd.DataFrame({
+        "행정동": sorted(set(env["DONG"]) | set(pop["DONG"]))})
+    per_dong["환경 센서 수"] = per_dong["행정동"].map(env.groupby("DONG")["SN"].nunique()).fillna(0).astype(int)
+    per_dong["유동인구 센서 수"] = per_dong["행정동"].map(pop.groupby("DONG")["SERIAL_NO"].nunique()).fillna(0).astype(int)
+    safe_table(per_dong)
+    st.caption("한 행정동에 센서가 여러 개면 평균으로 섞입니다(한계).")
 
 with tab_graph:
-    if len(final) < 5:
+    if not METRICS or len(final) < 5:
         st.info("분석에 쓸 수 있는 행이 5개 미만입니다. 기간을 넓히거나 다른 자치구를 골라보세요.")
     else:
-        st.caption(f"{gu_name} · {d0} ~ {d1} · 분석 행 {len(final):,}개")
-        y = st.selectbox("볼 환경 지표", list(METRICS), format_func=METRICS.get)
-        p = final.dropna(subset=[y]).copy()
-        p["시각"] = p["HOUR"].dt.hour
+        st.caption(f"{gu_name} · {d0} ~ {d1} · 병합 행 {len(final):,}개")
+        left, right = st.columns(2)
+        y = left.selectbox("볼 환경 지표", list(METRICS), format_func=METRICS.get)
+        drop0 = right.checkbox("방문자 0명인 행 제외", value=False)
+
+        p_all = final.dropna(subset=[y]).copy()
+        p_all["시각"] = p_all["HOUR"].dt.hour
+        zero_share = (p_all["VISITOR_MEAN"] == 0).mean() * 100
+        p = p_all[p_all["VISITOR_MEAN"] > 0].copy() if drop0 else p_all
+        if len(p) < 5:
+            st.info("조건에 맞는 행이 5개 미만입니다.")
+            st.stop()
+
+        z = p_all.groupby("시각")["VISITOR_MEAN"].apply(lambda s: (s == 0).mean() * 100).reset_index(name="0명 비율")
+        st.markdown(f"방문자 평균이 **0명인 행: {zero_share:.1f}%** ({int((p_all['VISITOR_MEAN']==0).sum()):,} / {len(p_all):,}행)")
+
         x = p["VISITOR_MEAN"]
         r = x.corr(p[y])
         slope, icpt = np.polyfit(x, p[y], 1)
@@ -423,8 +410,8 @@ with tab_graph:
         xs = np.array([x.min(), x.max()])
         fig1.add_trace(go.Scatter(x=xs, y=slope * xs + icpt, mode="lines", name="추세선", line=dict(color="red")))
         st.plotly_chart(fig1, use_container_width=True)
-        st.markdown(f"**찾아낸 것:** 방문자 수와 {METRICS[y]}의 상관계수는 **{r:.3f}**, 방문자 10명 증가당 **{slope*10:+.2f}**. "
-                    f"같은 시각끼리만 비교하면(시각별 평균을 뺀 값) 상관계수 **{r_in:.3f}**, 10명당 **{slope_in*10:+.2f}**입니다. (n={len(p):,})")
+        st.markdown(f"**찾아낸 것:** 방문자 수와 {METRICS[y]}의 상관계수는 **{r:.3f}**, 방문자 10명 증가당 **{slope*10:+.3f}**. "
+                    f"같은 시각끼리만 비교하면(시각별 평균을 뺀 값) 상관계수 **{r_in:.3f}**, 10명당 **{slope_in*10:+.3f}**입니다. (n={len(p):,})")
 
         hh = p.groupby("시각")[["VISITOR_MEAN", y]].mean().reset_index()
         fig2 = make_subplots(specs=[[{"secondary_y": True}]])
@@ -437,20 +424,27 @@ with tab_graph:
         st.plotly_chart(fig2, use_container_width=True)
         pk_v, pk_y = hh.loc[hh["VISITOR_MEAN"].idxmax()], hh.loc[hh[y].idxmax()]
         st.markdown(f"**찾아낸 것:** 방문자 수는 **{int(pk_v['시각'])}시**({pk_v['VISITOR_MEAN']:.1f}명), "
-                    f"{METRICS[y]}은 **{int(pk_y['시각'])}시**({pk_y[y]:.1f})에 가장 높습니다. "
+                    f"{METRICS[y]}은 **{int(pk_y['시각'])}시**({pk_y[y]:.2f})에 가장 높습니다. "
                     f"시각별 평균끼리의 상관계수는 **{hh['VISITOR_MEAN'].corr(hh[y]):.3f}**입니다.")
 
         q = p.copy()
-        try:
-            q["구간"] = pd.qcut(q["VISITOR_MEAN"], 4, labels=["적음(하위25%)", "보통 이하", "보통 이상", "많음(상위25%)"])
-            fig3 = px.box(q, x="구간", y=y, labels={"구간": "방문자 수 구간", y: METRICS[y]},
-                          title=f"그래프 3. 방문자 수 구간별 {METRICS[y]} 분포")
-            st.plotly_chart(fig3, use_container_width=True)
-            m = q.groupby("구간", observed=True)[y].mean()
-            st.markdown(f"**찾아낸 것:** 방문자가 가장 적은 구간의 {METRICS[y]} 평균은 **{m.iloc[0]:.1f}**, "
-                        f"가장 많은 구간은 **{m.iloc[-1]:.1f}** (차이 {m.iloc[-1]-m.iloc[0]:+.1f}).")
-        except ValueError:
-            st.info("방문자 수 값이 너무 비슷해 4개 구간으로 나눌 수 없습니다.")
+        q["구간"] = pd.qcut(q["VISITOR_MEAN"].rank(method="first"), 4,
+                           labels=["적음(하위25%)", "보통 이하", "보통 이상", "많음(상위25%)"])
+        fig3 = px.box(q, x="구간", y=y, labels={"구간": "방문자 수 구간", y: METRICS[y]},
+                      title=f"그래프 3. 방문자 수 구간별 {METRICS[y]} 분포")
+        st.plotly_chart(fig3, use_container_width=True)
+        m = q.groupby("구간", observed=True)[y].mean()
+        st.markdown(f"**찾아낸 것:** 방문자가 가장 적은 구간의 {METRICS[y]} 평균은 **{m.iloc[0]:.2f}**, "
+                    f"가장 많은 구간은 **{m.iloc[-1]:.2f}** (차이 {m.iloc[-1]-m.iloc[0]:+.2f}).")
+
+        fig4 = px.bar(z, x="시각", y="0명 비율",
+                      labels={"시각": "하루 중 시각 (시)", "0명 비율": "방문자 0명인 행의 비율 (%)"},
+                      title="그래프 4. 시각별 방문자 0명 비율")
+        st.plotly_chart(fig4, use_container_width=True)
+        zmax = z.loc[z["0명 비율"].idxmax()]
+        zmin = z.loc[z["0명 비율"].idxmin()]
+        st.markdown(f"**찾아낸 것:** 0명 비율은 **{int(zmax['시각'])}시**에 {zmax['0명 비율']:.1f}%로 가장 높고, "
+                    f"**{int(zmin['시각'])}시**에 {zmin['0명 비율']:.1f}%로 가장 낮습니다.")
 
 # ---------------- 모델 비교 ----------------
 def make_models(depth, trees):
@@ -591,6 +585,6 @@ with tab_raw:
         st.subheader("병합 데이터")
         show(ko(merged))
         st.subheader("환경정보 원본")
-        show(ko(env_raw[ENV_COLS]))
+        show(ko(env_raw))
         st.subheader("유동인구 원본")
         show(ko(pop_raw))
