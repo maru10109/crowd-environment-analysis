@@ -12,7 +12,6 @@ from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegresso
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit
 
-
 st.set_page_config(page_title="인파기상청", page_icon="🌡️", layout="wide")
 
 # ---------------- API 키 (Streamlit Secrets) ----------------
@@ -25,9 +24,7 @@ except KeyError as e:
 
 ENV_SERVICE, POP_SERVICE, PAGE = "IotVdata017", "IotVdata018", 1000
 MAX_DAYS = 14
-MIN_COVER = 5.0   # 값이 있는 비율(%)이 이보다 낮은 열은 분석에서 제외
-
-ALWAYS = ["AVG_TP", "AVG_HUM"]   # 값이 적어도 항상 분석에 포함 (온도, 습도)
+ALWAYS = ["AVG_TP", "AVG_HUM"]   # 값이 적어도 항상 분석에 포함
 
 DISTRICTS = {
     "강남구": "Gangnam-gu", "강동구": "Gangdong-gu", "강북구": "Gangbuk-gu",
@@ -50,6 +47,7 @@ CANDS = {
     "AVG_SO": "이산화황(ppm)", "AVG_NH3": "암모니아(ppm)", "AVG_H2S": "황화수소(ppm)",
     "AVG_OZON": "오존(ppm)",
 }
+VIBR = ["AVG_VIBR_XCRD", "AVG_VIBR_YCRD", "AVG_VIBR_ZCRD"]
 KO = {
     "MDL_NO": "모델번호", "SN": "시리얼(환경)", "MSRMT_HR": "측정시간", "RGN": "지역유형",
     "CGG": "자치구", "DONG": "행정동", "MODEL_NM": "모델명", "SERIAL_NO": "시리얼(유동인구)",
@@ -68,6 +66,7 @@ def show(df, n=1000):
     if len(df) > n:
         st.caption(f"전체 {len(df):,}행 중 앞 {n:,}행만 표시합니다.")
     st.dataframe(df.head(n), use_container_width=True, hide_index=True)
+
 
 def safe_table(df):
     d = df.copy()
@@ -126,7 +125,8 @@ def fetch_all(key, service, gu, days, max_pages):
 
 # ---------------- 전처리: 환경정보 ----------------
 @st.cache_data(show_spinner="환경정보 전처리 중...")
-def clean_env(raw, hum100_missing):
+def clean_env(raw, hum100_missing, min_cover, thr):
+    """thr: {'illu': 기준 or None, 'vibr': 기준 or None, 'uv': 기준 or None}"""
     steps, n_raw = [], len(raw)
 
     def add(stage, col, rule, action, n_val, n_sn):
@@ -155,57 +155,79 @@ def clean_env(raw, hum100_missing):
         if n:
             add("3. 형식", CANDS[c], "숫자로 변환 불가", "빈 값 처리", n, "-")
 
-    # 4) 열별 값 보유 비율 -> 분석 가능한 열 선택
+    cover_raw = {c: df[c].notna().mean() * 100 for c in CANDS}
+
+    # 4) 사용자 기준 이하 값 결측 처리 (조도·진동·자외선)
+    if thr.get("illu") is not None:
+        m = df["AVG_INILLU"] <= thr["illu"]
+        add("4. 사용자 기준", "조도", f"값 ≤ {thr['illu']} lux", "결측 처리", m.sum(), df.loc[m, "SN"].nunique())
+        df.loc[m, "AVG_INILLU"] = np.nan
+    if thr.get("uv") is not None:
+        m = df["AVG_UV"] <= thr["uv"]
+        add("4. 사용자 기준", "자외선", f"값 ≤ {thr['uv']}", "결측 처리", m.sum(), df.loc[m, "SN"].nunique())
+        df.loc[m, "AVG_UV"] = np.nan
+    if thr.get("vibr") is not None:
+        for c in VIBR:
+            m = df[c].abs() <= thr["vibr"]
+            add("4. 사용자 기준", CANDS[c], f"|값| ≤ {thr['vibr']} g", "결측 처리", m.sum(), df.loc[m, "SN"].nunique())
+            df.loc[m, c] = np.nan
+
+    # 5) 열별 값 보유 비율 -> 분석 열 선택
     cover = {c: df[c].notna().mean() * 100 for c in CANDS}
-    metrics = [c for c in CANDS if c in ALWAYS or cover[c] >= MIN_COVER]
+    metrics = [c for c in CANDS if c in ALWAYS or cover[c] >= min_cover]
     for c in CANDS:
-        used = ("분석에 사용(고정)" if c in ALWAYS else "분석에 사용") if c in metrics else f"값이 {MIN_COVER:.0f}% 미만이라 제외"
-        add("4. 결측", CANDS[c], f"값이 있는 비율 {cover[c]:.1f}%", used, df[c].isna().sum(), df.loc[df[c].isna(), "SN"].nunique())
+        if c in metrics:
+            used = "분석에 사용(고정)" if c in ALWAYS else "분석에 사용"
+        else:
+            used = f"값이 {min_cover:g}% 미만이라 제외"
+        add("5. 결측", CANDS[c], f"값이 있는 비율 {cover[c]:.1f}%", used,
+            df[c].isna().sum(), df.loc[df[c].isna(), "SN"].nunique())
     miss0 = {c: int(df[c].isna().sum()) for c in metrics}
 
-    # 5) 범위 이상치
+    # 6) 범위 이상치
     if "AVG_TP" in metrics:
         bad = (df["AVG_TP"] == -40) | (df["AVG_TP"] < -30) | (df["AVG_TP"] > 50)
-        add("5. 이상치(범위)", "온도", "-40℃(센서 오류 기본값) 또는 -30℃ 미만·50℃ 초과", "빈 값 처리", bad.sum(), df.loc[bad, "SN"].nunique())
+        add("6. 이상치(범위)", "온도", "-40℃(센서 오류 기본값) 또는 -30℃ 미만·50℃ 초과", "빈 값 처리", bad.sum(), df.loc[bad, "SN"].nunique())
         df.loc[bad, "AVG_TP"] = np.nan
     if "AVG_HUM" in metrics:
         bad = (df["AVG_HUM"] < 0) | (df["AVG_HUM"] > 100)
-        add("5. 이상치(범위)", "습도", "0% 미만 또는 100% 초과", "빈 값 처리", bad.sum(), df.loc[bad, "SN"].nunique())
+        add("6. 이상치(범위)", "습도", "0% 미만 또는 100% 초과", "빈 값 처리", bad.sum(), df.loc[bad, "SN"].nunique())
         df.loc[bad, "AVG_HUM"] = np.nan
     for c in metrics:
-        if c in ("AVG_TP", "AVG_HUM", "AVG_GT"):
+        if c in ("AVG_TP", "AVG_HUM", "AVG_GT") or c in VIBR:   # 진동은 음수도 정상값
             continue
         bad = df[c] < 0
-        add("5. 이상치(범위)", CANDS[c], "음수(물리적으로 불가능)", "빈 값 처리", bad.sum(), df.loc[bad, "SN"].nunique())
+        add("6. 이상치(범위)", CANDS[c], "음수(물리적으로 불가능)", "빈 값 처리", bad.sum(), df.loc[bad, "SN"].nunique())
         df.loc[bad, c] = np.nan
 
-    # 6) 의심 값
+    # 7) 의심 값
     if "AVG_HUM" in metrics:
         m = df["AVG_HUM"] == 100
-        add("6. 의심 값", "습도", "정확히 100%", "결측 처리" if hum100_missing else "유지(분석에 사용)", m.sum(), df.loc[m, "SN"].nunique())
+        add("7. 의심 값", "습도", "정확히 100%", "결측 처리" if hum100_missing else "유지(분석에 사용)", m.sum(), df.loc[m, "SN"].nunique())
         if hum100_missing:
             df.loc[m, "AVG_HUM"] = np.nan
 
-    # 7) 온도 튀는 값
+    # 8) 온도 튀는 값
     if "AVG_TP" in metrics:
         df = df.sort_values(["SN", "time"])
         med = (df.groupby("SN")["AVG_TP"].rolling(5, center=True, min_periods=3).median()
                  .reset_index(level=0, drop=True).reindex(df.index))
         sp = (df["AVG_TP"] - med).abs() > 5
-        add("7. 이상치(튐)", "온도", "같은 센서 앞뒤 5개 중앙값과 5℃ 초과 차이", "빈 값 처리", sp.sum(), df.loc[sp, "SN"].nunique())
+        add("8. 이상치(튐)", "온도", "같은 센서 앞뒤 5개 중앙값과 5℃ 초과 차이", "빈 값 처리", sp.sum(), df.loc[sp, "SN"].nunique())
         df.loc[sp, "AVG_TP"] = np.nan
 
     miss1 = {c: int(df[c].isna().sum()) for c in metrics}
 
-    # 8) 센서별 1시간 평균
+    # 9) 센서별 1시간 평균
     df["HOUR"] = df["time"].dt.floor("h")
     agg = df.groupby(["SN", "CGG", "DONG", "HOUR"], as_index=False)[metrics].mean()
-    add("8. 집계", "전체", "센서별 1시간 평균(두 데이터의 측정 분이 다름)", f"{len(df):,}행 → {len(agg):,}행", len(df), df["SN"].nunique())
+    add("9. 집계", "전체", "센서별 1시간 평균(두 데이터의 측정 분이 다름)", f"{len(df):,}행 → {len(agg):,}행", len(df), df["SN"].nunique())
 
     sensors = (df.groupby("SN")[metrics].apply(lambda x: x.notna().mean() * 100).round(1)
                  .rename(columns=CANDS).reset_index().rename(columns={"SN": "센서(환경)"}))
     stat = {"n_raw": n_raw, "n_dedup": n_after_dup, "n_agg": len(agg),
-            "miss0": miss0, "miss1": miss1, "metrics": metrics, "cover": cover}
+            "miss0": miss0, "miss1": miss1, "metrics": metrics,
+            "cover": cover, "cover_raw": cover_raw}
     return agg, pd.DataFrame(steps), sensors, stat
 
 
@@ -259,9 +281,21 @@ with st.sidebar:
                         min_value=today - pd.Timedelta(days=31), max_value=today)
     st.caption(f"Open API는 최근 한 달 자료만 제공합니다. 최대 {MAX_DAYS}일까지 조회.")
     btn = st.button("📥 API에서 데이터 불러오기", type="primary")
-    st.header("🧹 의심 값 처리(팀 결정)")
+
+    st.header("🧹 결측 처리 기준(팀 결정)")
     hum100_missing = st.checkbox("습도 100%를 결측으로 처리", value=False)
-    st.caption("체크를 바꿔 결과 차이를 비교하고 log에 기록하세요. 온도 -40℃는 항상 결측 처리합니다.")
+    min_cover = st.slider("열 사용 최소 값 비율(%)", 0.0, 30.0, 5.0, 0.5,
+                          help="값이 있는 비율이 이보다 낮은 열은 분석에서 뺍니다. 가스 열이 안 보이면 낮춰 보세요.")
+    st.markdown("**낮은 값을 결측으로 처리**")
+    thr = {"illu": None, "vibr": None, "uv": None}
+    if st.checkbox("조도: 이 값 이하를 결측", value=False):
+        thr["illu"] = st.number_input("조도 기준 (lux 이하)", min_value=0.0, value=0.0, step=1.0)
+    if st.checkbox("진동: |값|이 이 값 이하면 결측", value=False):
+        thr["vibr"] = st.number_input("진동 기준 (g 이하, 절댓값)", min_value=0.0, value=0.0, step=0.001, format="%.4f")
+    if st.checkbox("자외선: 이 값 이하를 결측", value=False):
+        thr["uv"] = st.number_input("자외선 기준 (UV 이하)", min_value=0.0, value=0.0, step=0.1)
+    st.caption("조도는 밤에 실제로 0에 가깝습니다. 기준을 올릴수록 밤 데이터가 사라지니 전후를 비교해 log에 기록하세요. "
+               "온도 -40℃는 항상 결측 처리합니다.")
 
 if btn:
     if not (isinstance(rng, (tuple, list)) and len(rng) == 2):
@@ -307,7 +341,7 @@ if env_raw.empty or pop_raw.empty:
     st.error("한쪽 데이터가 비어 있습니다. 다른 날짜나 자치구를 골라보세요.")
     st.stop()
 
-env, env_log, env_sensor, es = clean_env(env_raw, hum100_missing)
+env, env_log, env_sensor, es = clean_env(env_raw, hum100_missing, float(min_cover), thr)
 pop, pop_log = clean_pop(pop_raw)
 METRICS = {c: CANDS[c] for c in es["metrics"]}
 
@@ -326,6 +360,7 @@ c4.metric("유동인구 원본", f"{len(pop_raw):,}행")
 tab_ov, tab_clean, tab_merge, tab_graph, tab_model, tab_raw = st.tabs(
     ["📋 데이터 개요", "🧹 결측치·이상치 처리", "🔗 병합 기록", "📈 그래프와 발견",
      "🤖 모델 비교", "🗂 데이터 보기"])
+
 with tab_ov:
     st.subheader("환경정보 (IotVdata017)")
     st.write(f"**{len(env_raw):,}행 × {env_raw.shape[1]}열**")
@@ -339,10 +374,12 @@ with tab_clean:
     st.subheader("분석에 쓸 환경 열 선택 결과")
     safe_table(pd.DataFrame({
         "열": [CANDS[c] for c in CANDS],
-        "값이 있는 비율(%)": [round(es["cover"][c], 1) for c in CANDS],
+        "원본 값 비율(%)": [round(es["cover_raw"][c], 1) for c in CANDS],
+        "사용자 기준 적용 후 값 비율(%)": [round(es["cover"][c], 1) for c in CANDS],
         "사용 여부": ["사용" if c in METRICS else "제외(값 부족)" for c in CANDS]}))
-    st.caption(f"값이 있는 비율이 {MIN_COVER:.0f}% 미만인 열은 분석에서 뺍니다. 소음은 방문자 수가 소음을 올리는 방향의 관계라 "
-               "(선생님 의견) 환경 변화 지표에서 제외했습니다.")
+    st.caption(f"값이 있는 비율이 {min_cover:g}% 미만인 열은 분석에서 뺍니다(온도·습도는 항상 사용). "
+               "가스·풍속 열이 '제외'라면 API가 그 열을 거의 채우지 않은 것입니다. 사이드바 슬라이더로 기준을 낮춰 확인할 수 있습니다. "
+               "소음은 방문자 수가 소음을 올리는 방향의 관계라(선생님 의견) 제외했습니다.")
     st.subheader("환경정보 처리 단계")
     safe_table(env_log)
     st.subheader("분석 열별 빈 값 변화 (센서별 10분 단위 행 기준)")
@@ -369,13 +406,13 @@ with tab_merge:
              f"→ 병합 후 {len(merged):,}행")
     st.write(f"환경 센서 {env['SN'].nunique()}개 · 유동인구 센서 {pop['SERIAL_NO'].nunique()}개 · "
              f"행정동 {merged['DONG'].nunique()}개")
-    per_dong = pd.DataFrame({
-        "행정동": sorted(set(env["DONG"]) | set(pop["DONG"]))})
+    per_dong = pd.DataFrame({"행정동": sorted(set(env["DONG"]) | set(pop["DONG"]))})
     per_dong["환경 센서 수"] = per_dong["행정동"].map(env.groupby("DONG")["SN"].nunique()).fillna(0).astype(int)
     per_dong["유동인구 센서 수"] = per_dong["행정동"].map(pop.groupby("DONG")["SERIAL_NO"].nunique()).fillna(0).astype(int)
     safe_table(per_dong)
     st.caption("한 행정동에 센서가 여러 개면 평균으로 섞입니다(한계).")
 
+# ---------------- 그래프 ----------------
 with tab_graph:
     if not METRICS or len(final) < 5:
         st.info("분석에 쓸 수 있는 행이 5개 미만입니다. 기간을 넓히거나 다른 자치구를 골라보세요.")
@@ -387,204 +424,50 @@ with tab_graph:
 
         p_all = final.dropna(subset=[y]).copy()
         p_all["시각"] = p_all["HOUR"].dt.hour
-        zero_share = (p_all["VISITOR_MEAN"] == 0).mean() * 100
         p = p_all[p_all["VISITOR_MEAN"] > 0].copy() if drop0 else p_all
         if len(p) < 5:
             st.info("조건에 맞는 행이 5개 미만입니다.")
-            st.stop()
-
-        z = p_all.groupby("시각")["VISITOR_MEAN"].apply(lambda s: (s == 0).mean() * 100).reset_index(name="0명 비율")
-        st.markdown(f"방문자 평균이 **0명인 행: {zero_share:.1f}%** ({int((p_all['VISITOR_MEAN']==0).sum()):,} / {len(p_all):,}행)")
-
-        x = p["VISITOR_MEAN"]
-        r = x.corr(p[y])
-        slope, icpt = np.polyfit(x, p[y], 1)
-        xd = x - p.groupby("시각")["VISITOR_MEAN"].transform("mean")
-        yd = p[y] - p.groupby("시각")[y].transform("mean")
-        r_in = xd.corr(yd)
-        slope_in = np.polyfit(xd, yd, 1)[0] if xd.std() > 0 else np.nan
-
-        fig1 = px.scatter(p, x="VISITOR_MEAN", y=y, opacity=0.5,
-                          labels={"VISITOR_MEAN": "평균 방문자 수 (명)", y: METRICS[y]},
-                          title=f"그래프 1. 방문자 수와 {METRICS[y]}의 관계")
-        xs = np.array([x.min(), x.max()])
-        fig1.add_trace(go.Scatter(x=xs, y=slope * xs + icpt, mode="lines", name="추세선", line=dict(color="red")))
-        st.plotly_chart(fig1, use_container_width=True)
-        st.markdown(f"**찾아낸 것:** 방문자 수와 {METRICS[y]}의 상관계수는 **{r:.3f}**, 방문자 10명 증가당 **{slope*10:+.3f}**. "
-                    f"같은 시각끼리만 비교하면(시각별 평균을 뺀 값) 상관계수 **{r_in:.3f}**, 10명당 **{slope_in*10:+.3f}**입니다. (n={len(p):,})")
-
-        hh = p.groupby("시각")[["VISITOR_MEAN", y]].mean().reset_index()
-        fig2 = make_subplots(specs=[[{"secondary_y": True}]])
-        fig2.add_trace(go.Scatter(x=hh["시각"], y=hh["VISITOR_MEAN"], name="평균 방문자 수(명)", mode="lines+markers"), secondary_y=False)
-        fig2.add_trace(go.Scatter(x=hh["시각"], y=hh[y], name=f"평균 {METRICS[y]}", mode="lines+markers"), secondary_y=True)
-        fig2.update_layout(title=f"그래프 2. 하루 중 시각별 방문자 수와 {METRICS[y]}")
-        fig2.update_xaxes(title_text="하루 중 시각 (시)", dtick=2)
-        fig2.update_yaxes(title_text="평균 방문자 수 (명)", secondary_y=False)
-        fig2.update_yaxes(title_text=f"평균 {METRICS[y]}", secondary_y=True)
-        st.plotly_chart(fig2, use_container_width=True)
-        pk_v, pk_y = hh.loc[hh["VISITOR_MEAN"].idxmax()], hh.loc[hh[y].idxmax()]
-        st.markdown(f"**찾아낸 것:** 방문자 수는 **{int(pk_v['시각'])}시**({pk_v['VISITOR_MEAN']:.1f}명), "
-                    f"{METRICS[y]}은 **{int(pk_y['시각'])}시**({pk_y[y]:.2f})에 가장 높습니다. "
-                    f"시각별 평균끼리의 상관계수는 **{hh['VISITOR_MEAN'].corr(hh[y]):.3f}**입니다.")
-
-        q = p.copy()
-        q["구간"] = pd.qcut(q["VISITOR_MEAN"].rank(method="first"), 4,
-                           labels=["적음(하위25%)", "보통 이하", "보통 이상", "많음(상위25%)"])
-        fig3 = px.box(q, x="구간", y=y, labels={"구간": "방문자 수 구간", y: METRICS[y]},
-                      title=f"그래프 3. 방문자 수 구간별 {METRICS[y]} 분포")
-        st.plotly_chart(fig3, use_container_width=True)
-        m = q.groupby("구간", observed=True)[y].mean()
-        st.markdown(f"**찾아낸 것:** 방문자가 가장 적은 구간의 {METRICS[y]} 평균은 **{m.iloc[0]:.2f}**, "
-                    f"가장 많은 구간은 **{m.iloc[-1]:.2f}** (차이 {m.iloc[-1]-m.iloc[0]:+.2f}).")
-
-        fig4 = px.bar(z, x="시각", y="0명 비율",
-                      labels={"시각": "하루 중 시각 (시)", "0명 비율": "방문자 0명인 행의 비율 (%)"},
-                      title="그래프 4. 시각별 방문자 0명 비율")
-        st.plotly_chart(fig4, use_container_width=True)
-        zmax = z.loc[z["0명 비율"].idxmax()]
-        zmin = z.loc[z["0명 비율"].idxmin()]
-        st.markdown(f"**찾아낸 것:** 0명 비율은 **{int(zmax['시각'])}시**에 {zmax['0명 비율']:.1f}%로 가장 높고, "
-                    f"**{int(zmin['시각'])}시**에 {zmin['0명 비율']:.1f}%로 가장 낮습니다.")
-
-# ---------------- 모델 비교 ----------------
-def make_models(depth, trees):
-    return {
-        "선형 회귀": LinearRegression(),
-        "결정 트리": DecisionTreeRegressor(max_depth=depth, min_samples_leaf=10, random_state=0),
-        "랜덤 포레스트": RandomForestRegressor(n_estimators=trees, max_depth=depth,
-                                          min_samples_leaf=10, n_jobs=-1, random_state=0),
-        "그래디언트 부스팅": HistGradientBoostingRegressor(max_depth=depth, max_iter=trees,
-                                                   learning_rate=0.1, random_state=0),
-    }
-
-
-def metrics_of(yt, yp):
-    return (mean_absolute_error(yt, yp), np.sqrt(mean_squared_error(yt, yp)), r2_score(yt, yp))
-
-
-with tab_model:
-    st.subheader("모델 비교: 방문자 수가 환경 수치를 얼마나 더 설명하는가")
-    st.markdown("정답(y)은 환경 값, 입력(X)은 방문자 수와 시간 정보입니다. 시간 순서로 나눠(앞쪽 학습, 뒤쪽 테스트) 평가합니다.")
-
-    if not METRICS or len(final) < 50:
-        st.info("모델을 만들기엔 행이 부족합니다(50행 미만). 기간을 넓혀 보세요.")
-    else:
-        c1_, c2_, c3_, c4_ = st.columns(4)
-        target = c1_.selectbox("예측할 환경 값", list(METRICS), format_func=METRICS.get, key="m_target")
-        feat_set = c2_.selectbox("입력 세트", ["A. 방문자 수만", "B. 시각·요일만", "C. 시각·요일 + 방문자 수"],
-                                 index=2, key="m_feat")
-        train_pct = c3_.slider("학습 비율(%)", 60, 90, 80, 5, key="m_split")
-        depth = c4_.slider("트리 깊이", 2, 12, 6, key="m_depth")
-        trees = st.slider("나무 수 (랜덤 포레스트·부스팅)", 20, 300, 100, 20, key="m_trees")
-
-        d = final.dropna(subset=[target]).sort_values("HOUR").copy()
-        d["시각"] = d["HOUR"].dt.hour
-        d["요일"] = d["HOUR"].dt.dayofweek
-        cols = {"A": ["VISITOR_MEAN"], "B": ["시각", "요일"], "C": ["시각", "요일", "VISITOR_MEAN"]}[feat_set[0]]
-
-        if len(d) < 50 or d["HOUR"].nunique() < 3:
-            st.info("시간 구간이 너무 적습니다. 기간을 넓혀 보세요.")
         else:
-            # 시간 기준 분할: 같은 시각은 한쪽에만 들어가도록 시각 경계로 자름
-            times = np.sort(d["HOUR"].unique())
-            cut = times[max(1, min(len(times) - 1, int(len(times) * train_pct / 100)))]
-            tr, te = d[d["HOUR"] < cut], d[d["HOUR"] >= cut]
-            if len(tr) < 20 or len(te) < 10:
-                st.info("학습 또는 테스트 행이 너무 적습니다. 비율을 조정하거나 기간을 넓혀 보세요.")
-            else:
-                st.caption(f"학습 {len(tr):,}행 ({tr['HOUR'].min():%m-%d %H시} ~ {tr['HOUR'].max():%m-%d %H시}) · "
-                           f"테스트 {len(te):,}행 ({te['HOUR'].min():%m-%d %H시} ~ {te['HOUR'].max():%m-%d %H시})")
-                Xtr, Xte, ytr, yte = tr[cols], te[cols], tr[target], te[target]
+            zero_share = (p_all["VISITOR_MEAN"] == 0).mean() * 100
+            z = p_all.groupby("시각")["VISITOR_MEAN"].apply(lambda s: (s == 0).mean() * 100).reset_index(name="0명 비율")
+            st.markdown(f"방문자 평균이 **0명인 행: {zero_share:.1f}%** ({int((p_all['VISITOR_MEAN']==0).sum()):,} / {len(p_all):,}행)")
 
-                rows, preds = [], {}
-                base = np.full(len(yte), ytr.mean())
-                rows.append(("베이스라인: 평균 예측", *metrics_of(yte, base)))
-                preds["베이스라인: 평균 예측"] = base
-                hmean = tr.groupby("시각")[target].mean()
-                hb = te["시각"].map(hmean).fillna(ytr.mean()).values
-                rows.append(("베이스라인: 시각별 평균", *metrics_of(yte, hb)))
-                preds["베이스라인: 시각별 평균"] = hb
+            x = p["VISITOR_MEAN"]
+            r = x.corr(p[y])
+            slope, icpt = np.polyfit(x, p[y], 1)
+            xd = x - p.groupby("시각")["VISITOR_MEAN"].transform("mean")
+            yd = p[y] - p.groupby("시각")[y].transform("mean")
+            r_in = xd.corr(yd)
+            slope_in = np.polyfit(xd, yd, 1)[0] if xd.std() > 0 else np.nan
 
-                models = make_models(depth, trees)
-                for name, mdl in models.items():
-                    mdl.fit(Xtr, ytr)
-                    pr = mdl.predict(Xte)
-                    preds[name] = pr
-                    rows.append((name, *metrics_of(yte, pr)))
-                res = pd.DataFrame(rows, columns=["모델", "MAE", "RMSE", "R²"])
-                base_mae = res.loc[0, "MAE"]
-                res["평균 예측 대비 MAE 개선(%)"] = ((base_mae - res["MAE"]) / base_mae * 100).round(1)
+            fig1 = px.scatter(p, x="VISITOR_MEAN", y=y, opacity=0.5,
+                              labels={"VISITOR_MEAN": "평균 방문자 수 (명)", y: METRICS[y]},
+                              title=f"그래프 1. 방문자 수와 {METRICS[y]}의 관계")
+            xs = np.array([x.min(), x.max()])
+            fig1.add_trace(go.Scatter(x=xs, y=slope * xs + icpt, mode="lines", name="추세선", line=dict(color="red")))
+            st.plotly_chart(fig1, use_container_width=True)
+            st.markdown(f"**찾아낸 것:** 방문자 수와 {METRICS[y]}의 상관계수는 **{r:.3f}**, 방문자 10명 증가당 **{slope*10:+.3f}**. "
+                        f"같은 시각끼리만 비교하면(시각별 평균을 뺀 값) 상관계수 **{r_in:.3f}**, 10명당 **{slope_in*10:+.3f}**입니다. (n={len(p):,})")
 
-                st.markdown(f"#### 결과: {METRICS[target]} · 입력 `{feat_set}`")
-                safe_table(res.round(3))
-                st.caption("MAE·RMSE는 낮을수록, R²는 높을수록 좋습니다. R²가 0 이하면 평균 예측보다 못한 모델입니다.")
+            hh = p.groupby("시각")[["VISITOR_MEAN", y]].mean().reset_index()
+            fig2 = make_subplots(specs=[[{"secondary_y": True}]])
+            fig2.add_trace(go.Scatter(x=hh["시각"], y=hh["VISITOR_MEAN"], name="평균 방문자 수(명)", mode="lines+markers"), secondary_y=False)
+            fig2.add_trace(go.Scatter(x=hh["시각"], y=hh[y], name=f"평균 {METRICS[y]}", mode="lines+markers"), secondary_y=True)
+            fig2.update_layout(title=f"그래프 2. 하루 중 시각별 방문자 수와 {METRICS[y]}")
+            fig2.update_xaxes(title_text="하루 중 시각 (시)", dtick=2)
+            fig2.update_yaxes(title_text="평균 방문자 수 (명)", secondary_y=False)
+            fig2.update_yaxes(title_text=f"평균 {METRICS[y]}", secondary_y=True)
+            st.plotly_chart(fig2, use_container_width=True)
+            pk_v, pk_y = hh.loc[hh["VISITOR_MEAN"].idxmax()], hh.loc[hh[y].idxmax()]
+            st.markdown(f"**찾아낸 것:** 방문자 수는 **{int(pk_v['시각'])}시**({pk_v['VISITOR_MEAN']:.1f}명), "
+                        f"{METRICS[y]}은 **{int(pk_y['시각'])}시**({pk_y[y]:.2f})에 가장 높습니다. "
+                        f"시각별 평균끼리의 상관계수는 **{hh['VISITOR_MEAN'].corr(hh[y]):.3f}**입니다.")
 
-                best = res.iloc[2:].sort_values("MAE").iloc[0]
-                st.markdown(f"**찾아낸 것:** 모델 중 MAE가 가장 낮은 것은 **{best['모델']}** (MAE {best['MAE']:.3f}, "
-                            f"R² {best['R²']:.3f}), 평균 예측 대비 MAE가 **{best['평균 예측 대비 MAE 개선(%)']:.1f}%** 개선되었습니다.")
-
-                fig_m = px.bar(res, x="모델", y="MAE", color="모델",
-                               labels={"MAE": f"MAE ({METRICS[target]})"},
-                               title=f"모델별 MAE ({METRICS[target]}, 낮을수록 좋음)")
-                fig_m.update_layout(showlegend=False)
-                st.plotly_chart(fig_m, use_container_width=True)
-
-                pick = st.selectbox("실제값 vs 예측값을 볼 모델", list(preds)[2:], key="m_pick")
-                pdf = pd.DataFrame({"실제값": yte.values, "예측값": preds[pick]})
-                fig_p = px.scatter(pdf, x="실제값", y="예측값", opacity=0.5,
-                                   title=f"{pick}: 실제값 vs 예측값 ({METRICS[target]})")
-                lo, hi = pdf.min().min(), pdf.max().max()
-                fig_p.add_trace(go.Scatter(x=[lo, hi], y=[lo, hi], mode="lines", name="완벽한 예측",
-                                           line=dict(color="red", dash="dash")))
-                st.plotly_chart(fig_p, use_container_width=True)
-
-                # 방문자 수의 순수 기여: B와 C를 같은 조건으로 비교
-                st.markdown("#### 방문자 수가 추가로 설명하는 몫 (B와 C 비교)")
-                cmp_rows = []
-                for nm, cs in [("B. 시각·요일만", ["시각", "요일"]), ("C. 시각·요일 + 방문자 수", ["시각", "요일", "VISITOR_MEAN"])]:
-                    for mname, mdl in make_models(depth, trees).items():
-                        mdl.fit(tr[cs], ytr)
-                        cmp_rows.append((nm, mname, mean_absolute_error(yte, mdl.predict(te[cs]))))
-                cmp = pd.DataFrame(cmp_rows, columns=["입력 세트", "모델", "MAE"])
-                pv = cmp.pivot(index="모델", columns="입력 세트", values="MAE")
-                pv["방문자 수 추가 효과(MAE 감소, %)"] = ((pv.iloc[:, 0] - pv.iloc[:, 1]) / pv.iloc[:, 0] * 100).round(1)
-                safe_table(pv.round(3).reset_index())
-                st.caption("값이 0%에 가까우면 방문자 수는 시각·요일 외에 추가로 알려주는 게 거의 없다는 뜻입니다. 음수면 오히려 나빠진 것입니다.")
-
-                # 선형 회귀 계수
-                lr = LinearRegression().fit(tr[cols], ytr)
-                coef = pd.DataFrame({"입력": cols, "계수": lr.coef_})
-                if "VISITOR_MEAN" in cols:
-                    k = cols.index("VISITOR_MEAN")
-                    st.markdown(f"**선형 회귀:** 다른 입력이 같을 때 방문자 10명 증가당 {METRICS[target]} **{lr.coef_[k]*10:+.4f}** 변화")
-                safe_table(coef.round(4))
-
-                # 교차검증
-                if st.checkbox("시간 순서 교차검증으로 점수 흔들림 확인 (조금 느림)", key="m_cv"):
-                    tscv = TimeSeriesSplit(n_splits=4)
-                    dd = d.reset_index(drop=True)
-                    cv_rows = []
-                    for mname, mdl in make_models(depth, trees).items():
-                        maes = []
-                        for a, b in tscv.split(dd):
-                            mdl.fit(dd.loc[a, cols], dd.loc[a, target])
-                            maes.append(mean_absolute_error(dd.loc[b, target], mdl.predict(dd.loc[b, cols])))
-                        cv_rows.append((mname, np.mean(maes), np.std(maes)))
-                    safe_table(pd.DataFrame(cv_rows, columns=["모델", "MAE 평균", "MAE 표준편차"]).round(3))
-                    st.caption("표준편차가 크면 구간에 따라 성능이 들쭉날쭉한 불안정한 모델입니다.")
-
-    with st.expander("각 모델의 원리와 하이퍼파라미터 (구술 대비)"):
-        st.markdown(
-            "- **선형 회귀**: 입력과 정답 사이에 직선 관계를 가정하고 오차 제곱이 가장 작은 직선을 찾음. 하이퍼파라미터 거의 없음.\n"
-            "- **결정 트리**: '시각이 14시 이상인가?' 같은 질문으로 데이터를 나눠 구간별 평균을 예측. `max_depth`가 깊을수록 복잡해져 과적합 위험.\n"
-            "- **랜덤 포레스트**: 조금씩 다른 트리 여러 개의 예측을 평균. `n_estimators`(나무 수), `max_depth`, `min_samples_leaf`.\n"
-            "- **그래디언트 부스팅**: 나무를 순서대로 만들며 앞 나무의 오차를 다음 나무가 보정. `max_iter`(나무 수), `max_depth`, `learning_rate`(한 번에 보정하는 크기).")
-
-with tab_raw:
-    if st.checkbox("원본·병합 표 보기 (느릴 수 있음)"):
-        st.subheader("병합 데이터")
-        show(ko(merged))
-        st.subheader("환경정보 원본")
-        show(ko(env_raw))
-        st.subheader("유동인구 원본")
-        show(ko(pop_raw))
+            q = p.copy()
+            q["구간"] = pd.qcut(q["VISITOR_MEAN"].rank(method="first"), 4,
+                               labels=["적음(하위25%)", "보통 이하", "보통 이상", "많음(상위25%)"])
+            fig3 = px.box(q, x="구간", y=y, labels={"구간": "방문자 수 구간", y: METRICS[y]},
+                          title=f"그래프 3. 방문자 수 구간별 {METRICS[y]} 분포")
+            st.plotly_chart(fig3, use_container_width=True)
+            m = q.groupby("구간", observed=True)[y].mean()
+            st.markdown(f"**찾아낸 것:** 방문자가 가장 적은 
