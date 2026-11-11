@@ -470,4 +470,249 @@ with tab_graph:
                           title=f"그래프 3. 방문자 수 구간별 {METRICS[y]} 분포")
             st.plotly_chart(fig3, use_container_width=True)
             m = q.groupby("구간", observed=True)[y].mean()
-            st.markdown(f"**찾아낸 것:** 방문자가 가장 적은 
+            st.markdown(f"**찾아낸 것:** 방문자가 가장 적은 구간의 {METRICS[y]} 평균은 **{m.iloc[0]:.2f}**, "
+                        f"가장 많은 구간은 **{m.iloc[-1]:.2f}** (차이 {m.iloc[-1]-m.iloc[0]:+.2f}).")
+
+            fig4 = px.bar(z, x="시각", y="0명 비율",
+                          labels={"시각": "하루 중 시각 (시)", "0명 비율": "방문자 0명인 행의 비율 (%)"},
+                          title="그래프 4. 시각별 방문자 0명 비율")
+            st.plotly_chart(fig4, use_container_width=True)
+            zmax = z.loc[z["0명 비율"].idxmax()]
+            zmin = z.loc[z["0명 비율"].idxmin()]
+            st.markdown(f"**찾아낸 것:** 0명 비율은 **{int(zmax['시각'])}시**에 {zmax['0명 비율']:.1f}%로 가장 높고, "
+                        f"**{int(zmin['시각'])}시**에 {zmin['0명 비율']:.1f}%로 가장 낮습니다.")
+
+
+# ---------------- 모델 비교 ----------------
+def make_models(depth, trees):
+    return {
+        "선형 회귀": LinearRegression(),
+        "결정 트리": DecisionTreeRegressor(max_depth=depth, min_samples_leaf=10, random_state=0),
+        "랜덤 포레스트": RandomForestRegressor(n_estimators=trees, max_depth=depth,
+                                          min_samples_leaf=10, n_jobs=-1, random_state=0),
+        "그래디언트 부스팅": HistGradientBoostingRegressor(max_depth=depth, max_iter=trees,
+                                                   learning_rate=0.1, random_state=0),
+    }
+
+
+def metrics_of(yt, yp):
+    return (mean_absolute_error(yt, yp), np.sqrt(mean_squared_error(yt, yp)), r2_score(yt, yp))
+
+
+with tab_model:
+    st.subheader("모델 비교: 방문자 수가 환경 수치를 얼마나 더 설명하는가")
+    st.markdown("정답(y)은 환경 값, 입력(X)은 방문자 수와 시간 정보입니다. "
+                "시간 순서로 나눠(앞쪽 학습, 뒤쪽 테스트) 평가합니다.")
+
+    if not METRICS or len(final) < 50:
+        st.info("모델을 만들기엔 행이 부족합니다(50행 미만). 기간을 넓혀 보세요.")
+    else:
+        # ---- 설정 ----
+        with st.container(border=True):
+            st.markdown("**① 기본 설정**")
+            c1_, c2_, c3_, c4_ = st.columns(4)
+            target = c1_.selectbox("예측할 환경 값", list(METRICS), format_func=METRICS.get, key="m_target")
+            feat_set = c2_.selectbox("입력 세트", ["A. 방문자 수만", "B. 시각·요일만", "C. 시각·요일 + 방문자 수"],
+                                     index=2, key="m_feat")
+            train_pct = c3_.slider("학습 비율(%)", 60, 90, 80, 5, key="m_split")
+            depth = c4_.slider("트리 깊이", 2, 12, 6, key="m_depth")
+            trees = st.slider("나무 수 (랜덤 포레스트·부스팅)", 20, 300, 100, 20, key="m_trees")
+
+            st.markdown("**② 성능 개선 옵션**")
+            o1, o2, o3, o4 = st.columns(4)
+            opt_cyc = o1.checkbox("시각 sin/cos", value=False, key="o_cyc",
+                                  help="23시와 0시가 가깝다는 것을 모델이 알게 합니다.")
+            opt_oh = o2.checkbox("시각 원-핫", value=False, key="o_oh",
+                                 help="0~23시를 각각 따로 구분하는 열로 만듭니다.")
+            opt_wk = o3.checkbox("주말 여부 추가", value=False, key="o_wk")
+            opt_detr = o4.checkbox("날씨 효과 제거", value=False, key="o_detr",
+                                   help="정답에서 그날의 평균을 빼, 하루 안에서의 변화만 예측합니다.")
+            run_cv = st.checkbox("시간 순서 교차검증도 실행 (조금 느림)", key="m_cv")
+
+        # ---- 데이터 준비 ----
+        d = final.dropna(subset=[target]).sort_values("HOUR").copy()
+        d["시각"] = d["HOUR"].dt.hour
+        d["요일"] = d["HOUR"].dt.dayofweek
+        d["날짜"] = d["HOUR"].dt.date
+        y_name = METRICS[target]
+        if opt_detr:
+            d["_y"] = d[target] - d.groupby("날짜")[target].transform("mean")
+            y_name = f"{METRICS[target]} (그날 평균 대비 차이)"
+        else:
+            d["_y"] = d[target]
+
+        tf = ["시각", "요일"]
+        if opt_cyc:
+            d["시각_sin"] = np.sin(2 * np.pi * d["시각"] / 24)
+            d["시각_cos"] = np.cos(2 * np.pi * d["시각"] / 24)
+            tf += ["시각_sin", "시각_cos"]
+        if opt_oh:
+            for h in range(24):
+                d[f"시각_{h:02d}시"] = (d["시각"] == h).astype(int)
+            tf += [f"시각_{h:02d}시" for h in range(24)]
+        if opt_cyc or opt_oh:
+            tf.remove("시각")          # 숫자 시각은 대체됨
+        if opt_wk:
+            d["주말"] = (d["요일"] >= 5).astype(int)
+            tf.append("주말")
+        cols = {"A": ["VISITOR_MEAN"], "B": tf, "C": tf + ["VISITOR_MEAN"]}[feat_set[0]]
+
+        if len(d) < 50 or d["HOUR"].nunique() < 3:
+            st.info("시간 구간이 너무 적습니다. 기간을 넓혀 보세요.")
+        else:
+            times = np.sort(d["HOUR"].unique())
+            cut = times[max(1, min(len(times) - 1, int(len(times) * train_pct / 100)))]
+            tr, te = d[d["HOUR"] < cut], d[d["HOUR"] >= cut]
+            if len(tr) < 20 or len(te) < 10:
+                st.info("학습 또는 테스트 행이 너무 적습니다. 비율을 조정하거나 기간을 넓혀 보세요.")
+            else:
+                ytr, yte = tr["_y"], te["_y"]
+
+                # ---- 계산 ----
+                rows, preds = [], {}
+                base = np.full(len(yte), ytr.mean())
+                rows.append(("베이스라인: 평균 예측", "기준선", *metrics_of(yte, base)))
+                preds["베이스라인: 평균 예측"] = base
+                hmean = tr.groupby("시각")["_y"].mean()
+                hb = te["시각"].map(hmean).fillna(ytr.mean()).values
+                rows.append(("베이스라인: 시각별 평균", "기준선", *metrics_of(yte, hb)))
+                preds["베이스라인: 시각별 평균"] = hb
+                for name, mdl in make_models(depth, trees).items():
+                    mdl.fit(tr[cols], ytr)
+                    pr = mdl.predict(te[cols])
+                    preds[name] = pr
+                    rows.append((name, "모델", *metrics_of(yte, pr)))
+                res = pd.DataFrame(rows, columns=["모델", "구분", "MAE", "RMSE", "R²"])
+                base_mae = res.loc[0, "MAE"]
+                res["평균 예측 대비 MAE 개선(%)"] = ((base_mae - res["MAE"]) / base_mae * 100).round(1)
+                mod = res[res["구분"] == "모델"].sort_values("MAE").reset_index(drop=True)
+                mod.insert(0, "순위", range(1, len(mod) + 1))
+                best = mod.iloc[0]
+                hour_base_mae = res.loc[1, "MAE"]
+
+                # B vs C 비교
+                cmp_rows = []
+                for nm, cs in [("B", tf), ("C", tf + ["VISITOR_MEAN"])]:
+                    for mname, mdl in make_models(depth, trees).items():
+                        mdl.fit(tr[cs], ytr)
+                        cmp_rows.append((nm, mname, mean_absolute_error(yte, mdl.predict(te[cs]))))
+                cmp = pd.DataFrame(cmp_rows, columns=["세트", "모델", "MAE"]).pivot(
+                    index="모델", columns="세트", values="MAE")
+                cmp["방문자 수 추가 효과(MAE 감소, %)"] = ((cmp["B"] - cmp["C"]) / cmp["B"] * 100).round(1)
+                cmp = cmp.rename(columns={"B": "B. 시각·요일만 (MAE)", "C": "C. + 방문자 수 (MAE)"}).reset_index()
+                eff_best = cmp.loc[cmp["모델"] == best["모델"], "방문자 수 추가 효과(MAE 감소, %)"].iloc[0]
+
+                st.caption(f"학습 {len(tr):,}행 ({tr['HOUR'].min():%m-%d %H시} ~ {tr['HOUR'].max():%m-%d %H시}) · "
+                           f"테스트 {len(te):,}행 ({te['HOUR'].min():%m-%d %H시} ~ {te['HOUR'].max():%m-%d %H시}) · "
+                           f"입력 열 {len(cols)}개 · 입력 `{feat_set}`")
+
+                # ---- 요약 카드 ----
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("최고 성능 모델", best["모델"])
+                k2.metric("그 모델의 MAE", f"{best['MAE']:.3f}",
+                          f"평균 예측 대비 {best['평균 예측 대비 MAE 개선(%)']:+.1f}%", delta_color="off")
+                k3.metric("그 모델의 R²", f"{best['R²']:.3f}")
+                k4.metric("방문자 수 추가 효과", f"{eff_best:+.1f}%", "B→C, MAE 감소율", delta_color="off")
+                beat = best["MAE"] < hour_base_mae
+                st.markdown(f"**찾아낸 것:** 최고 모델은 **{best['모델']}** 이고, 시각별 평균 베이스라인(MAE {hour_base_mae:.3f})을 "
+                            f"**{'넘었습니다' if beat else '넘지 못했습니다'}**. "
+                            f"방문자 수를 추가했을 때 이 모델의 MAE 변화는 **{eff_best:+.1f}%** 입니다. "
+                            f"(대상: {y_name})")
+                if opt_detr:
+                    st.caption("날씨 효과 제거: 그날 전체 평균을 정답에서 뺐습니다. 이 평균에는 테스트 날짜의 값도 쓰이므로, "
+                               "미래 예측이 아니라 '하루 안의 변화 설명력'을 보는 분석입니다.")
+
+                t_res, t_plot, t_eff, t_cv, t_info = st.tabs(
+                    ["📊 결과표", "📈 예측 그래프", "👥 방문자 수 효과", "🔁 안정성(교차검증)", "📚 모델 원리"])
+
+                with t_res:
+                    st.markdown("**모델 순위 (MAE 낮은 순)**")
+                    safe_table(mod.drop(columns=["구분"]).round(3))
+                    st.markdown("**기준선과 전체 비교**")
+                    safe_table(res.drop(columns=["구분"]).round(3))
+                    st.caption("MAE·RMSE는 낮을수록, R²는 높을수록 좋습니다. R²가 0 이하면 평균 예측보다 못합니다. "
+                               "MAE는 정답과 같은 단위(예: ℃)의 평균 오차라 발표용 대표 지표로 씁니다.")
+                    fig_m = px.bar(res, x="모델", y="MAE", color="구분", text=res["MAE"].round(2),
+                                   color_discrete_map={"기준선": "#9aa0a6", "모델": "#1f77b4"},
+                                   title=f"모델별 MAE ({y_name}, 낮을수록 좋음)")
+                    fig_m.update_traces(textposition="outside")
+                    st.plotly_chart(fig_m, use_container_width=True)
+
+                with t_plot:
+                    pick = st.selectbox("살펴볼 모델", list(preds)[2:], key="m_pick")
+                    ts = pd.DataFrame({"HOUR": te["HOUR"].values, "실제값": yte.values, "예측값": preds[pick]})
+                    tsg = ts.groupby("HOUR", as_index=False).mean()
+                    fig_t = go.Figure()
+                    fig_t.add_trace(go.Scatter(x=tsg["HOUR"], y=tsg["실제값"], name="실제값", mode="lines+markers"))
+                    fig_t.add_trace(go.Scatter(x=tsg["HOUR"], y=tsg["예측값"], name="예측값", mode="lines+markers"))
+                    fig_t.update_layout(title=f"{pick}: 테스트 기간 실제값 vs 예측값 ({y_name}, 시각별 평균)",
+                                        xaxis_title="시간", yaxis_title=y_name)
+                    st.plotly_chart(fig_t, use_container_width=True)
+                    fig_p = px.scatter(ts, x="실제값", y="예측값", opacity=0.5,
+                                       title=f"{pick}: 실제값 vs 예측값 (점이 점선에 가까울수록 정확)")
+                    lo, hi = ts[["실제값", "예측값"]].min().min(), ts[["실제값", "예측값"]].max().max()
+                    fig_p.add_trace(go.Scatter(x=[lo, hi], y=[lo, hi], mode="lines", name="완벽한 예측",
+                                               line=dict(color="red", dash="dash")))
+                    st.plotly_chart(fig_p, use_container_width=True)
+                    resid = ts["예측값"] - ts["실제값"]
+                    st.markdown(f"**찾아낸 것:** 평균 오차(예측−실제)는 **{resid.mean():+.3f}** 입니다. "
+                                "0에서 멀면 모델이 한쪽으로 치우쳐 예측한다는 뜻입니다(예: 학습·테스트 날씨가 다를 때).")
+
+                with t_eff:
+                    st.markdown("**시각·요일만(B) vs 시각·요일 + 방문자 수(C)**")
+                    safe_table(cmp.round(3))
+                    st.caption("0%에 가까우면 방문자 수는 시각·요일 외에 추가로 알려주는 게 거의 없다는 뜻입니다. "
+                               "음수면 오히려 나빠진 것입니다. 이 표가 프로젝트의 핵심 질문에 가장 직접 답합니다.")
+                    fig_e = px.bar(cmp, x="모델", y="방문자 수 추가 효과(MAE 감소, %)",
+                                   text="방문자 수 추가 효과(MAE 감소, %)",
+                                   title="방문자 수를 넣었을 때 MAE 감소율 (%)")
+                    fig_e.update_traces(textposition="outside")
+                    st.plotly_chart(fig_e, use_container_width=True)
+                    lr = LinearRegression().fit(tr[tf + ["VISITOR_MEAN"]], ytr)
+                    k = (tf + ["VISITOR_MEAN"]).index("VISITOR_MEAN")
+                    st.markdown(f"**선형 회귀:** 다른 입력이 같을 때 방문자 10명 증가당 {y_name} **{lr.coef_[k]*10:+.4f}** 변화")
+                    st.caption("R²가 낮거나 음수인 모델에서 나온 계수는 의미를 부여하지 마세요.")
+
+                with t_cv:
+                    if not run_cv:
+                        st.info("위 설정 칸에서 '시간 순서 교차검증도 실행'을 체크하면 표시됩니다.")
+                    else:
+                        tscv = TimeSeriesSplit(n_splits=4)
+                        dd = d.reset_index(drop=True)
+                        cv_rows = []
+                        for mname, mdl in make_models(depth, trees).items():
+                            maes = []
+                            for a, b in tscv.split(dd):
+                                mdl.fit(dd.loc[a, cols], dd.loc[a, "_y"])
+                                maes.append(mean_absolute_error(dd.loc[b, "_y"], mdl.predict(dd.loc[b, cols])))
+                            cv_rows.append((mname, np.mean(maes), np.std(maes), min(maes), max(maes)))
+                        cvdf = pd.DataFrame(cv_rows, columns=["모델", "MAE 평균", "MAE 표준편차", "최소", "최대"])
+                        safe_table(cvdf.round(3))
+                        fig_c = px.bar(cvdf, x="모델", y="MAE 평균", error_y="MAE 표준편차",
+                                       title="교차검증 MAE 평균 (막대 위 선은 표준편차)")
+                        st.plotly_chart(fig_c, use_container_width=True)
+                        st.caption("표준편차가 크면 구간에 따라 성능이 들쭉날쭉한 불안정한 모델입니다. "
+                                   "같은 시각 행이 앞뒤 구간에 나뉠 수 있어 위의 단일 분할보다 약간 느슨한 평가입니다.")
+
+                with t_info:
+                    st.markdown(
+                        "- **베이스라인(평균 예측)**: 항상 학습 데이터 평균을 예측. 이것도 못 넘으면 모델이 무의미합니다.\n"
+                        "- **베이스라인(시각별 평균)**: 시각마다 학습 데이터의 평균을 예측. 방문자 수의 가치를 엄격하게 보는 기준입니다.\n"
+                        "- **선형 회귀**: 직선 관계를 가정하고 오차 제곱이 가장 작은 직선을 찾음. 해석이 쉬움.\n"
+                        "- **결정 트리**: '시각이 14시 이상인가?' 같은 질문으로 데이터를 나눠 구간별 평균을 예측. `max_depth`가 깊을수록 과적합 위험.\n"
+                        "- **랜덤 포레스트**: 조금씩 다른 트리 여러 개의 예측을 평균. `n_estimators`, `max_depth`, `min_samples_leaf`.\n"
+                        "- **그래디언트 부스팅**: 나무를 순서대로 만들며 앞 나무의 오차를 다음 나무가 보정. `max_iter`, `max_depth`, `learning_rate`.\n\n"
+                        "**개선 옵션의 뜻**\n"
+                        "- *시각 sin/cos*: 0시와 23시가 이어진 원이라는 것을 숫자로 표현.\n"
+                        "- *시각 원-핫*: 시각마다 따로 계수를 줘서 '시각별 평균'과 비슷한 정보를 선형 모델도 쓰게 함.\n"
+                        "- *주말 여부*: 평일과 주말의 차이를 반영.\n"
+                        "- *날씨 효과 제거*: 그날 평균을 빼서 날씨 변화가 아닌 하루 안의 변화만 보게 함.")
+
+with tab_raw:
+    if st.checkbox("원본·병합 표 보기 (느릴 수 있음)"):
+        st.subheader("병합 데이터")
+        show(ko(merged))
+        st.subheader("환경정보 원본")
+        show(ko(env_raw))
+        st.subheader("유동인구 원본")
+        show(ko(pop_raw))
