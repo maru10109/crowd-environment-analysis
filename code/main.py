@@ -357,9 +357,9 @@ c2.metric("기간", f"{d0} ~ {d1}", f"{n_days}일", delta_color="off")
 c3.metric("환경정보 원본", f"{len(env_raw):,}행")
 c4.metric("유동인구 원본", f"{len(pop_raw):,}행")
 
-tab_ov, tab_clean, tab_merge, tab_graph, tab_model, tab_raw = st.tabs(
+tab_ov, tab_clean, tab_merge, tab_graph, tab_model, tab_all, tab_raw = st.tabs(
     ["📋 데이터 개요", "🧹 결측치·이상치 처리", "🔗 병합 기록", "📈 그래프와 발견",
-     "🤖 모델 비교", "🗂 데이터 보기"])
+     "🤖 모델 비교", "🏆 종합 평가(모든 환경 값)", "🗂 데이터 보기"])
 
 with tab_ov:
     st.subheader("환경정보 (IotVdata017)")
@@ -528,7 +528,11 @@ with tab_model:
             opt_detr = o4.checkbox("날씨 효과 제거", value=False, key="o_detr",
                                    help="정답에서 그날의 평균을 빼, 하루 안에서의 변화만 예측합니다.")
             run_cv = st.checkbox("시간 순서 교차검증도 실행 (조금 느림)", key="m_cv")
-
+            
+            cfg = dict(feat_set=feat_set, train_pct=train_pct, depth=depth, trees=trees,
+                       opt_cyc=opt_cyc, opt_oh=opt_oh, opt_wk=opt_wk, opt_detr=opt_detr)
+            st.session_state["cfg"] = cfg
+            
         # ---- 데이터 준비 ----
         d = final.dropna(subset=[target]).sort_values("HOUR").copy()
         d["시각"] = d["HOUR"].dt.hour
@@ -707,7 +711,151 @@ with tab_model:
                         "- *시각 원-핫*: 시각마다 따로 계수를 줘서 '시각별 평균'과 비슷한 정보를 선형 모델도 쓰게 함.\n"
                         "- *주말 여부*: 평일과 주말의 차이를 반영.\n"
                         "- *날씨 효과 제거*: 그날 평균을 빼서 날씨 변화가 아닌 하루 안의 변화만 보게 함.")
+# ---------------- 종합 평가: 모든 환경 값 ----------------
+def build_xy(final_df, target, cfg):
+    """모델 비교 탭과 같은 규칙으로 입력·정답을 만든다. 실패하면 None."""
+    d = final_df.dropna(subset=[target]).sort_values("HOUR").copy()
+    if len(d) < 50 or d["HOUR"].nunique() < 3:
+        return None
+    d["시각"] = d["HOUR"].dt.hour
+    d["요일"] = d["HOUR"].dt.dayofweek
+    d["날짜"] = d["HOUR"].dt.date
+    d["_y"] = (d[target] - d.groupby("날짜")[target].transform("mean")) if cfg["opt_detr"] else d[target]
+    tf = ["시각", "요일"]
+    if cfg["opt_cyc"]:
+        d["시각_sin"] = np.sin(2 * np.pi * d["시각"] / 24)
+        d["시각_cos"] = np.cos(2 * np.pi * d["시각"] / 24)
+        tf += ["시각_sin", "시각_cos"]
+    if cfg["opt_oh"]:
+        for h in range(24):
+            d[f"시각_{h:02d}시"] = (d["시각"] == h).astype(int)
+        tf += [f"시각_{h:02d}시" for h in range(24)]
+    if cfg["opt_cyc"] or cfg["opt_oh"]:
+        tf.remove("시각")
+    if cfg["opt_wk"]:
+        d["주말"] = (d["요일"] >= 5).astype(int)
+        tf.append("주말")
+    cols = {"A": ["VISITOR_MEAN"], "B": tf, "C": tf + ["VISITOR_MEAN"]}[cfg["feat_set"][0]]
+    times = np.sort(d["HOUR"].unique())
+    cut = times[max(1, min(len(times) - 1, int(len(times) * cfg["train_pct"] / 100)))]
+    tr, te = d[d["HOUR"] < cut], d[d["HOUR"] >= cut]
+    if len(tr) < 20 or len(te) < 10:
+        return None
+    return tr, te, cols
 
+
+def eval_target(final_df, target, cfg):
+    """한 환경 값에 대해 {모델: MAE}와 두 기준선 MAE를 반환."""
+    out = build_xy(final_df, target, cfg)
+    if out is None:
+        return None
+    tr, te, cols = out
+    ytr, yte = tr["_y"], te["_y"]
+    mae = {"평균 예측": mean_absolute_error(yte, np.full(len(yte), ytr.mean()))}
+    hmean = tr.groupby("시각")["_y"].mean()
+    mae["시각별 평균"] = mean_absolute_error(yte, te["시각"].map(hmean).fillna(ytr.mean()).values)
+    for name, mdl in make_models(cfg["depth"], cfg["trees"]).items():
+        mdl.fit(tr[cols], ytr)
+        mae[name] = mean_absolute_error(yte, mdl.predict(te[cols]))
+    return mae
+
+
+with tab_all:
+    st.subheader("모든 환경 값에서 모델을 종합 평가")
+    st.markdown("환경 값마다 모델을 만들고, **기준선 대비 MAE 개선율(%)** 을 점수로 삼아 합산합니다. "
+                "단위가 다른 열(℃, lux, g)을 공정하게 더하기 위해 MAE 대신 개선율을 씁니다. "
+                "설정(입력 세트·학습 비율·깊이·옵션)은 **🤖 모델 비교 탭의 현재 설정**을 그대로 씁니다.")
+    cfg = st.session_state.get("cfg")
+    if cfg is None:
+        st.info("먼저 '🤖 모델 비교' 탭을 열어 설정을 한 번 확인하세요.")
+    elif not METRICS or len(final) < 50:
+        st.info("행이 부족합니다(50행 미만).")
+    else:
+        base_choice = st.radio("점수 기준선", ["시각별 평균 (엄격, 추천)", "평균 예측 (느슨)"], horizontal=True)
+        bkey = "시각별 평균" if base_choice.startswith("시각별") else "평균 예측"
+        if not cfg["opt_detr"]:
+            st.warning("'날씨 효과 제거'가 꺼져 있습니다. 날짜 간 날씨 차이가 점수를 흔들 수 있으니, "
+                       "켠 상태와 꺼진 상태를 둘 다 돌려 log에 기록하세요.")
+        st.caption(f"현재 설정: 입력 {cfg['feat_set']} · 학습 {cfg['train_pct']}% · 깊이 {cfg['depth']} · "
+                   f"나무 {cfg['trees']} · sin/cos {cfg['opt_cyc']} · 원-핫 {cfg['opt_oh']} · "
+                   f"주말 {cfg['opt_wk']} · 날씨 제거 {cfg['opt_detr']}")
+
+        if st.button("🏁 모든 환경 값 평가 실행", type="primary"):
+            all_mae, skipped = {}, []
+            bar = st.progress(0, text="평가 중...")
+            keys = list(METRICS)
+            for i, t in enumerate(keys):
+                r_ = eval_target(final, t, cfg)
+                if r_ is None:
+                    skipped.append(METRICS[t])
+                else:
+                    all_mae[t] = r_
+                bar.progress((i + 1) / len(keys), text=f"{METRICS[t]} 완료")
+            bar.empty()
+            st.session_state["all_mae"] = (all_mae, skipped, cfg)
+
+        if "all_mae" in st.session_state:
+            all_mae, skipped, used_cfg = st.session_state["all_mae"]
+            if used_cfg != cfg:
+                st.warning("모델 비교 탭의 설정이 바뀌었습니다. 아래 결과는 이전 설정 기준이니 다시 실행하세요.")
+            if skipped:
+                st.caption("행이 부족해 제외된 환경 값: " + ", ".join(skipped))
+            if not all_mae:
+                st.info("평가할 수 있는 환경 값이 없습니다.")
+            else:
+                model_names = list(make_models(cfg["depth"], cfg["trees"]))
+                imp = {}   # 개선율(%)
+                for t, m in all_mae.items():
+                    b = m[bkey]
+                    imp[METRICS[t]] = {n: float(np.clip((b - m[n]) / b * 100, -100, 100)) if b > 0 else np.nan
+                                       for n in model_names}
+                imp_df = pd.DataFrame(imp).T[model_names]          # 행: 환경 값, 열: 모델
+                imp_df = imp_df.dropna(how="all")
+
+                rank_df = imp_df.rank(axis=1, ascending=False, method="min")
+                summary = pd.DataFrame({
+                    "총합 점수(개선율 합, %)": imp_df.sum(),
+                    "평균 개선율(%)": imp_df.mean(),
+                    "평균 순위": rank_df.mean(),
+                    "1위 횟수": (rank_df == 1).sum(),
+                    f"{bkey}를 넘은 환경 값 수": (imp_df > 0).sum(),
+                }).sort_values("총합 점수(개선율 합, %)", ascending=False)
+                summary.insert(0, "종합 순위", range(1, len(summary) + 1))
+                top = summary.index[0]
+
+                st.markdown("### 종합 순위")
+                safe_table(summary.reset_index().rename(columns={"index": "모델"}).round(2))
+                n_t = len(imp_df)
+                st.markdown(f"**찾아낸 것:** 환경 값 {n_t}개를 합산한 종합 1위는 **{top}** "
+                            f"(평균 개선율 {summary.loc[top, '평균 개선율(%)']:+.1f}%, "
+                            f"1위 {int(summary.loc[top, '1위 횟수'])}회). "
+                            f"{bkey}를 넘은 환경 값은 {int(summary.loc[top, f'{bkey}를 넘은 환경 값 수'])}/{n_t}개입니다.")
+                if summary["평균 순위"].idxmin() != top:
+                    st.warning(f"총합 점수 1위({top})와 평균 순위 1위({summary['평균 순위'].idxmin()})가 다릅니다. "
+                               "일부 환경 값의 큰 개선율이 합을 끌어올렸을 수 있으니 아래 표를 확인하세요.")
+
+                st.markdown("### 환경 값별 개선율(%)")
+                safe_table(imp_df.reset_index().rename(columns={"index": "환경 값"}).round(1))
+                st.caption(f"개선율 = ({bkey} MAE − 모델 MAE) ÷ {bkey} MAE × 100. "
+                           "양수면 기준선보다 나은 것이고, 음수면 못한 것입니다. 극단값은 -100~100%로 잘랐습니다.")
+
+                fig_h = px.imshow(imp_df.round(1), text_auto=True, aspect="auto",
+                                  color_continuous_scale="RdYlGn", color_continuous_midpoint=0,
+                                  title=f"환경 값 × 모델 개선율(%) (기준선: {bkey})")
+                st.plotly_chart(fig_h, use_container_width=True)
+                fig_s = px.bar(summary.reset_index().rename(columns={"index": "모델"}),
+                               x="모델", y="평균 개선율(%)", text="평균 개선율(%)",
+                               title="모델별 평균 개선율(%) (높을수록 좋음)")
+                fig_s.update_traces(texttemplate="%{text:.1f}", textposition="outside")
+                st.plotly_chart(fig_s, use_container_width=True)
+
+                st.markdown("### 해석할 때 주의")
+                st.markdown(
+                    "- 이 점수는 **MAE 개선율만** 쓴 것입니다. 선생님 질문(방문자 수의 영향)에 답하려면 입력 세트를 B와 C로 각각 돌려 비교해야 합니다.\n"
+                    "- 총합은 환경 값 개수가 많을수록 커지니, 서로 다른 구·기간의 총합끼리 비교하지 말고 **평균 개선율**을 쓰세요.\n"
+                    "- 열마다 테스트 행 수가 다르고(결측 때문), 한 번 나눈 평가라 순위가 약간 바뀔 수 있습니다.\n"
+                    "- 하이퍼파라미터(깊이·나무 수)는 모든 환경 값에 같은 값을 씁니다. 열별로 최적이 아닐 수 있습니다.")
+                
 with tab_raw:
     if st.checkbox("원본·병합 표 보기 (느릴 수 있음)"):
         st.subheader("병합 데이터")
