@@ -116,8 +116,8 @@
 - 이 결과로 "인파가 환경을 바꾼다 / 바꾸지 않는다"고 인과를 단정할 수 없습니다. 같은 시각에 함께 움직이는 값의 관계입니다.
 
 ## 더 해 보고 싶은 것 (교과 연계 · 진로)
-- 교과 연계: [예: 통합과학(기후), 정보(데이터 분석)]
-- 진로 분야: [팀]
+- 교과 연계: 
+- 진로 분야: 
 - 더 해 볼 분석: 다른 구·기간 반복 검증, 방문자 상위 25% 시간대 분석, 오차가 큰 시간의 행정동·시각 분석, 가스 센서가 있는 행정동만 따로 분석
 
 ## 느끼고 배운 점 (AI 활용 · 데이터 분석)
@@ -133,8 +133,5 @@
 ## 참고문헌
 1. 서울특별시, 스마트서울 도시데이터 센서(S-DoT) 환경정보(OA-15969), 서울 열린데이터광장, https://data.seoul.go.kr/dataList/OA-15969/S/1/datasetView.do, 접근일 [날짜], 공공누리 1유형
 2. 서울특별시, 스마트서울 도시데이터 센서(S-DoT) 유동인구 측정 정보(OA-15964), https://data.seoul.go.kr/dataList/OA-15964/S/1/datasetView.do, 접근일 [날짜], 공공누리 1유형
-3. 소프트웨어: Python, pandas, NumPy, scikit-learn, plotly, Streamlit [버전 기재]
+3. 소프트웨어: Python, pandas, NumPy, scikit-learn, plotly, Streamlit
 4. 생성형 AI: Claude Sonnet 5.5(Anthropic)
-
-## 실행 방법
-`streamlit run code/main.py` (API 키는 Streamlit Secrets의 `ENV_API_KEY`, `POP_API_KEY`). 필요한 라이브러리는 `requirements.txt`.
